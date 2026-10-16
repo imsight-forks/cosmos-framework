@@ -113,7 +113,9 @@ def flash2_attention_check(
         causal_type=causal_type,
     )
 
-    if is_causal and causal_type not in [CausalType.BottomRight, CausalType.DontCare]:
+    # Equal-length dense self-attention has identical top-left and bottom-right masks.
+    square_top_left = not is_varlen and causal_type == CausalType.TopLeft and query_shape[1] == key_shape[1]
+    if is_causal and causal_type not in [CausalType.BottomRight, CausalType.DontCare] and not square_top_left:
         target_fn("Flash Attention v2 only supports bottom-right causal masking.", exception=RuntimeError)
         return False
 

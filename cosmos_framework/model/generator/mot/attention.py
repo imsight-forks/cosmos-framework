@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -161,14 +162,19 @@ def _use_varlen(num_samples: int, *, has_caption_offsets: bool) -> bool:
     KV whenever this returns False (the dense API has no ranges to fence padding off with), and
     any padded query rows are independent of the real rows and simply discarded downstream.
 
-    The dense path is gated to forward-only (inference) execution via ``torch.is_grad_enabled``,
+    By default, the dense path is gated to forward-only (inference) execution via ``torch.is_grad_enabled``,
     which is False under ``torch.no_grad()``/``torch.inference_mode()`` and True during training.
     This avoids branching on the sample count during training, where batch composition varies
     between single- and multi-sample packs; keeping a single code path there prevents
     torch.compile from specializing on both shapes and incurring the associated recompilation
     overhead.
 
-    The grad-mode test precedes the sample-count comparison so that training never *compares*
+    ``COSMOS_ALLOW_SINGLE_SAMPLE_DENSE_TRAINING=1`` opts training into the same dense shortcut
+    for single-sample packs without caption subdivisions. This supports the experimental A800
+    Nano generation-LoRA path while retaining the FlashAttention 2 varlen restriction. It may
+    specialize compiled graphs on sample count; eager execution is the qualified configuration.
+
+    The default grad-mode test precedes the sample-count comparison so that training never *compares*
     the count, since ``or`` stops at the first true operand. Obtaining the count costs no kernel and no device
     sync -- ``get_num_real_samples`` reads it off a shape -- but comparing it against a constant
     makes torch.compile specialize the enclosing graph on it, and a training run whose packs hold
@@ -196,7 +202,12 @@ def _use_varlen(num_samples: int, *, has_caption_offsets: bool) -> bool:
     Returns:
         bool: True to pass varlen metadata to :func:`attention`, False to use the dense API.
     """
-    return has_caption_offsets or torch.is_grad_enabled() or guard_or_true(num_samples > 1)
+    # Experimental opt-in: the existing single-sample dense path is mathematically valid
+    # in backward too. Its upstream training restriction avoids compile specialization.
+    force_varlen_training = (
+        torch.is_grad_enabled() and os.environ.get("COSMOS_ALLOW_SINGLE_SAMPLE_DENSE_TRAINING") != "1"
+    )
+    return has_caption_offsets or force_varlen_training or guard_or_true(num_samples > 1)
 
 
 def two_way_attention(
