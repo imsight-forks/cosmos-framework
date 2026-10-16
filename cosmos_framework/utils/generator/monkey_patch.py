@@ -20,11 +20,23 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionAttention,
     Qwen3VLMoeVisionModel,
 )
+from transformers.utils import ModelOutput
 from transformers.utils.import_utils import is_torchdynamo_compiling
 
 from cosmos_framework.utils import log
 
-_EXPECTED_TRANSFORMERS_VERSION_PREFIX = "4.57."
+_GROUPED_MM_TRANSFORMERS_VERSION_PREFIX = "4.57."
+_QWEN3_VL_VERSION_PREFIXES = ("4.57.", "5.1.")
+
+
+def _qwen3_visual_features(
+    visual: torch.nn.Module, pixels: torch.Tensor, grid_thw: torch.Tensor
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Normalize HF4's feature tuple and HF5's structured vision output."""
+    if transformers.__version__.startswith("5."):
+        output = visual(pixels, grid_thw=grid_thw, return_dict=True)
+        return output.pooler_output, output.deepstack_features
+    return visual(pixels, grid_thw=grid_thw)
 
 
 def _in_autograd_backward() -> bool:
@@ -69,7 +81,7 @@ def patch_qwen3_vl_forward(model):
         model: The ``Qwen3VLModel`` / ``Qwen3VLMoeModel`` instance (i.e.
             ``model.model.model`` when the outer model is ``HFModel``).
     """
-    if not transformers.__version__.startswith(_EXPECTED_TRANSFORMERS_VERSION_PREFIX):
+    if not transformers.__version__.startswith(_QWEN3_VL_VERSION_PREFIXES):
         raise ValueError(f"monkey patching transformers version {transformers.__version__} is not supported")
 
     if not isinstance(model, (Qwen3VLModel, Qwen3VLMoeModel)):
@@ -142,8 +154,8 @@ def patch_qwen3_vl_forward(model):
         if has_image or has_video:
             visual_pixel_values = torch.cat(visual_pixel_values_list, dim=0).type(self.visual.dtype)  # [N_patch,D]
             visual_grid_thw = torch.cat(visual_grid_thw_list, dim=0)  # [N_media,3]
-            visual_embeds, deepstack_visual_feature_lists = self.visual(
-                visual_pixel_values, grid_thw=visual_grid_thw
+            visual_embeds, deepstack_visual_feature_lists = _qwen3_visual_features(
+                self.visual, visual_pixel_values, visual_grid_thw
             )  # visual_embeds: [N_visual,C]
             image_embeds = visual_embeds[:image_embed_len]  # [N_image_visual,C]
             video_embeds = visual_embeds[image_embed_len : image_embed_len + video_embed_len]  # [N_video_visual,C]
@@ -179,7 +191,7 @@ def patch_qwen3_vl_forward(model):
                 dtype=self.visual.dtype,
             )  # [N_dummy_patch,D]
             dummy_thw = torch.tensor([[1, dummy_h, dummy_w]], device=inputs_embeds.device)  # [1,3]
-            image_embeds, deepstack_image_embeds = self.visual(dummy_pixels, grid_thw=dummy_thw)
+            image_embeds, deepstack_image_embeds = _qwen3_visual_features(self.visual, dummy_pixels, dummy_thw)
             image_embeds = image_embeds[0:0]  # [0,C]
             deepstack_image_embeds = [e[0:0] for e in deepstack_image_embeds]  # each: [0,C]
 
@@ -248,13 +260,15 @@ def patch_qwen3_vl_forward(model):
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
-                delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
+                cache_start = (
+                    cache_position[0]
+                    if cache_position is not None
+                    else (0 if past_key_values is None else past_key_values.get_seq_length())
                 )
+                delta = (cache_start + self.rope_deltas).to(inputs_embeds.device)
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                if cache_position is not None:  # otherwise `deltas` is an int `0`
-                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
@@ -336,7 +350,9 @@ def patch_qwen3_vl_moe_grouped_mm_experts(model: torch.nn.Module) -> int:
             ``Qwen3VLMoeTextSparseMoeBlock`` (wrong model family — patching nothing would
             silently leave the slow path in place).
     """
-    if not transformers.__version__.startswith(_EXPECTED_TRANSFORMERS_VERSION_PREFIX):
+    # HF5 changes the router return contract and transposes the expert parameters. The
+    # HF4 grouped-mm implementation cannot be attached to those modules unchanged.
+    if not transformers.__version__.startswith(_GROUPED_MM_TRANSFORMERS_VERSION_PREFIX):
         raise ValueError(f"monkey patching transformers version {transformers.__version__} is not supported")
 
     # Local imports: moe_kernels imports triton at module scope, and the dense (non-MoE)
@@ -526,7 +542,7 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module) -> int:
     Raises:
         ValueError: if no vision tower is found.
     """
-    if not transformers.__version__.startswith(_EXPECTED_TRANSFORMERS_VERSION_PREFIX):
+    if not transformers.__version__.startswith(_QWEN3_VL_VERSION_PREFIXES):
         raise ValueError(f"monkey patching transformers version {transformers.__version__} is not supported")
 
     # Local import: the adapter pulls in cosmos_framework.model.attention, which probes for flash/NATTEN
@@ -625,7 +641,7 @@ def patch_qwen3_vl_vision_varlen_attention(model: torch.nn.Module) -> int:
             hidden_states: torch.Tensor,  # [N_patch,patch_dim]
             grid_thw: torch.Tensor,  # [N_media,3]
             **kwargs,
-        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        ) -> tuple[torch.Tensor, list[torch.Tensor]] | ModelOutput:
             # Packed sequence lengths are h*w per grid row (a t-frame video contributes t
             # sequences of the same length), so the longest sequence is max(h*w) — the same
             # value HF's FA2 branch derives from cu_seqlens, read here once for the whole

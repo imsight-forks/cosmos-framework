@@ -2412,7 +2412,7 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
     """
 
     # lm_head.weight is tied to model.embed_tokens.weight
-    _tied_weights_keys: list[str] = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3VLMoTConfig):
         # Materialize a fresh HF ``Qwen3VLTextConfig`` from the wrapper.
