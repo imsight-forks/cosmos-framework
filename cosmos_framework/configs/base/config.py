@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import importlib
 from typing import Any, List
 
 import attrs
@@ -45,7 +46,27 @@ class Config(config.Config):
     )
 
 
-def make_config() -> Config:
+def _register_experiments(experiment_module: str | None = None) -> None:
+    """Register an explicit experiment module, or the complete legacy catalog."""
+    modules = (
+        (experiment_module,)
+        if experiment_module is not None
+        else (
+            "cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano",
+            "cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano",
+            "cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano",
+            "cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_robocasa_nano",
+            "cosmos_framework.configs.base.experiment.action.posttrain_config.action_fd_droid_posttrain",
+            "cosmos_framework.configs.base.experiment.sft.vision_sft_nano",
+            "cosmos_framework.configs.base.experiment.sft.vision_sft_super",
+            "cosmos_framework.configs.base.experiment.sft.vision_sft_edge",
+        )
+    )
+    for module in modules:
+        importlib.import_module(module)
+
+
+def make_config(experiment_module: str | None = None) -> Config:
     c = Config(
         model=None,
         optimizer=None,
@@ -76,8 +97,8 @@ def make_config() -> Config:
     # from cosmos_framework.configs.base.defaults.data import register_data
     from cosmos_framework.configs.base.defaults.model import register_model
     from cosmos_framework.configs.base.defaults.optimizer import register_optimizer, register_scheduler
-    from cosmos_framework.configs.base.defaults.tokenizer import register_sound_tokenizer, register_tokenizer
     from cosmos_framework.configs.base.defaults.reasoner import register_vlm
+    from cosmos_framework.configs.base.defaults.tokenizer import register_sound_tokenizer, register_tokenizer
 
     # Call this function to register config groups for advanced overriding. the order follows the default config groups
     # register_data()
@@ -92,15 +113,6 @@ def make_config() -> Config:
     register_ema()
     register_vlm()
 
-    # Register shipped experiments explicitly. (vision_sft_nano also defines
-    # vision_sft_nano_mapstyle_dataloader — the CosmosDataLoader variant — in the same module.)
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_droid_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_all_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_libero_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_policy_robocasa_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.action.posttrain_config.action_fd_droid_posttrain  # noqa: F401
-    import cosmos_framework.configs.base.experiment.sft.vision_sft_nano  # noqa: F401
-    import cosmos_framework.configs.base.experiment.sft.vision_sft_super  # noqa: F401
-    import cosmos_framework.configs.base.experiment.sft.vision_sft_edge  # noqa: F401
+    _register_experiments(experiment_module)
 
     return c

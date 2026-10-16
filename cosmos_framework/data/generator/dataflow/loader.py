@@ -8,11 +8,10 @@ each DataLoader worker. The canonical training dataloader.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.utils.data
-import numpy as np
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.generator.dataflow.base import (
     BatchCollator,
     DataDistributor,
@@ -21,6 +20,7 @@ from cosmos_framework.data.generator.dataflow.base import (
 )
 from cosmos_framework.data.generator.dataflow.batchers import SimpleBatcher
 from cosmos_framework.data.generator.dataflow.collators import DefaultBatchCollator
+from cosmos_framework.utils import log
 
 
 class _DataflowIterableDataset(torch.utils.data.IterableDataset):
@@ -117,11 +117,10 @@ class CosmosDataLoader(torch.utils.data.DataLoader):
         persistent_workers: bool = False,
         pin_memory: bool = False,
         parallel_dims=None,
+        seed: int | None = None,
     ):
         if batch_size is not None and batcher is not None:
-            raise ValueError(
-                "Pass either batch_size= (sugar) or an explicit batcher=, not both."
-            )
+            raise ValueError("Pass either batch_size= (sugar) or an explicit batcher=, not both.")
         if batch_size is None and batcher is None:
             raise ValueError("Provide either a batcher= or a batch_size=.")
         if batch_size is not None:
@@ -176,6 +175,11 @@ class CosmosDataLoader(torch.utils.data.DataLoader):
         )
         if num_workers > 0 and prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = prefetch_factor
+        if seed is not None:
+            # DataLoader iterator construction draws a base seed even with zero
+            # workers. Keep that draw off the trainer's checkpointed RNG stream
+            # so fresh-process resume consumes the same next denoising noise.
+            loader_kwargs["generator"] = torch.Generator().manual_seed(seed)
         super().__init__(dataset, batch_size=None, **loader_kwargs)
 
 
@@ -203,9 +207,7 @@ class JointCosmosDataLoader:
         seed: int = 42,
     ) -> None:
         entries = [
-            (name, cfg["dataloader"], cfg["ratio"])
-            for name, cfg in dataloaders.items()
-            if cfg.get("ratio", 0) > 0
+            (name, cfg["dataloader"], cfg["ratio"]) for name, cfg in dataloaders.items() if cfg.get("ratio", 0) > 0
         ]
         if not entries:
             raise ValueError("JointCosmosDataLoader: no dataloaders with ratio > 0")

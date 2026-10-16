@@ -14,6 +14,8 @@ the state-dict keys ``<path>.lora_A.weight`` and ``<path>.lora_B.weight``.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 import torch.nn as nn
@@ -55,6 +57,7 @@ class LoraInjectedLinear(nn.Linear):
         self.lora_B = nn.Linear(rank, base.out_features, bias=False, device="meta")
         self._lora_rank = int(rank)
         self._lora_alpha = float(alpha)
+        self._lora_enabled = True
 
     @property
     def _lora_scale(self) -> float:
@@ -62,8 +65,29 @@ class LoraInjectedLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = F.linear(x, self.weight, self.bias)
+        if not self._lora_enabled:
+            return base_out
         lora_out = self.lora_B(self.lora_A(x))
         return base_out + self._lora_scale * lora_out
+
+
+@contextmanager
+def lora_disabled(network: nn.Module) -> Iterator[None]:
+    """Evaluate the unchanged native base without merging or changing weights.
+
+    Supports nested contexts and restores each module's previous enabled state,
+    including when a fixed-input qualification forward raises.
+    """
+    previous = [
+        (module, module._lora_enabled) for module in network.modules() if isinstance(module, LoraInjectedLinear)
+    ]
+    try:
+        for module, _ in previous:
+            module._lora_enabled = False
+        yield
+    finally:
+        for module, enabled in previous:
+            module._lora_enabled = enabled
 
 
 def _target_matches(full_child_path: str, child_name: str, target: str) -> bool:

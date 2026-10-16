@@ -34,10 +34,14 @@ import copy
 
 from hydra.core.config_store import ConfigStore
 
+from cosmos_framework.callbacks.cosmos_dataloader_state import CosmosDataLoaderStateCallback
+from cosmos_framework.callbacks.generation_lora_audit import GenerationLoraAudit
+from cosmos_framework.configs.base.defaults.tokenizer import AVAE_48k_25hzConfig
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
 from cosmos_framework.data.generator.dataflow import (
     CosmosDataLoader,
     IdentityProcessor,
+    MapDistributor,
     RankPartitionedDistributor,
     SequentialPackingBatcher,
     VFMListCollator,
@@ -47,6 +51,7 @@ from cosmos_framework.data.generator.joint_dataloader import (
     RankPartitionedDataLoader,
 )
 from cosmos_framework.data.generator.local_datasets.sft_dataset import get_sft_dataset
+from cosmos_framework.data.generator.local_datasets.transfer_sft_dataset import get_transfer_sft_map_dataset
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
 
@@ -348,6 +353,72 @@ vision_sft_nano_mapstyle_dataloader.dataloader_train = L(CosmosDataLoader)(
 )
 
 
-for _item in [vision_sft_nano, vision_sft_nano_mapstyle_dataloader]:
+# Paired segmentation uses the upstream flow objective and clean-control packer.
+# Keep released action head weights present and frozen for exact base binding.
+segmentation_sft_nano = copy.deepcopy(vision_sft_nano_mapstyle_dataloader)
+segmentation_sft_nano.job.name = "segmentation_sft_nano"
+segmentation_sft_nano.model.config.action_gen = True
+segmentation_sft_nano.model.config.sound_gen = True
+segmentation_sft_nano.model.config.sound_dim = 64
+segmentation_sft_nano.model.config.sound_tokenizer = copy.deepcopy(AVAE_48k_25hzConfig)
+segmentation_sft_nano.model.config.sound_tokenizer.bucket_name = ""
+segmentation_sft_nano.model.config.sound_tokenizer.object_store_credential_path_pretrained = ""
+segmentation_sft_nano.model.config.sound_tokenizer.avae_path = "${oc.env:AVAE_PATH}"
+segmentation_sft_nano.model.config.sound_tokenizer.normalize_latents = False
+segmentation_sft_nano.model.config.sound_tokenizer.normalization_type = "none"
+# Match the staged model's untied text embeddings, rather than the generic
+# caption-only SFT recipe's nested tie_word_embeddings=True override.
+segmentation_sft_nano.model.config.vlm_config.model_instance.config.tie_word_embeddings = False
+segmentation_sft_nano.model.config.vlm_config.tokenizer.config_variant = "hf"
+segmentation_sft_nano.model.config.vlm_config.tokenizer.pretrained_model_name = "${oc.env:TEXT_TOKENIZER_PATH}"
+segmentation_sft_nano.model.config.lora_enabled = True
+segmentation_sft_nano.model.config.lora_rank = 16
+segmentation_sft_nano.model.config.lora_alpha = 32
+segmentation_sft_nano.model.config.lora_target_modules = "q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen"
+segmentation_sft_nano.model.config.ema.enabled = False
+segmentation_sft_nano.model.config.compile.enabled = False
+segmentation_sft_nano.model.config.resolution = "704"
+segmentation_sft_nano.model.config.tokenizer.encode_chunk_frames["704"] = 8
+segmentation_sft_nano.model.config.rectified_flow_training_config.shift["704"] = 10
+segmentation_sft_nano.model.config.rectified_flow_training_config.exclude_fully_conditioned_items = True
+segmentation_sft_nano.optimizer.keys_to_select = ["lora_"]
+segmentation_sft_nano.optimizer.lr = 1e-4
+segmentation_sft_nano.optimizer.fused = True
+segmentation_sft_nano.trainer.grad_accum_iter = 1
+segmentation_sft_nano.trainer.max_iter = 20
+segmentation_sft_nano.checkpoint.keys_to_skip_loading = ["net_ema.", "lora_"]
+segmentation_sft_nano.checkpoint.save_iter = 10
+segmentation_sft_nano.trainer.callbacks.dataloader_state = L(CosmosDataLoaderStateCallback)()
+segmentation_sft_nano.trainer.callbacks.generation_lora_audit = L(GenerationLoraAudit)(
+    evidence_dir="${oc.env:LORA_AUDIT_DIR}"
+)
+segmentation_sft_nano.dataloader_train = L(CosmosDataLoader)(
+    distributor=L(MapDistributor)(
+        dataset=L(get_transfer_sft_map_dataset)(
+            jsonl_paths=["${oc.env:DATASET_PATH}/train.jsonl"],
+            control_type="seg",
+            resolution="704",
+            num_video_frames=93,
+            frame_selection_mode="first",
+            temporal_interval_mode="force_one",
+            temporal_compression_factor=4,
+            conditioning_config={0: 1.0},
+            cfg_dropout_rate=0.1,
+            conditioning_fps=-1,
+            max_caption_tokens=2048,
+            tokenizer_config="${model.config.vlm_config.tokenizer}",
+        ),
+        seed=42,
+        shuffle=True,
+    ),
+    processor=L(IdentityProcessor)(),
+    batcher=L(SequentialPackingBatcher)(max_samples_per_batch=1),
+    collator=L(VFMListCollator)(),
+    num_workers=0,
+    seed=42,
+)
+
+
+for _item in [vision_sft_nano, vision_sft_nano_mapstyle_dataloader, segmentation_sft_nano]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

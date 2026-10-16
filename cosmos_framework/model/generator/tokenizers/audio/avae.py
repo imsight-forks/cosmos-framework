@@ -202,17 +202,14 @@ class AVAEModel:
             device=device,
         )
 
-        # Set to eval mode and freeze
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
-
         # Remove weight norm (must be done before dtype conversion)
         if hasattr(self.model, "remove_weight_norm"):
             self.model.remove_weight_norm()
 
-        # Convert to target dtype
+        # Removing weight norm creates replacement Parameters with requires_grad
+        # enabled. Freeze the final parameter set after all materialization.
         self.model = self.model.to(dtype=dtype)
+        self.model.eval().requires_grad_(False)
 
     def count_param(self) -> int:
         """Count model parameters."""

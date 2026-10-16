@@ -38,6 +38,7 @@ Workflow
 """
 
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -141,7 +142,14 @@ class TransferSFTDataset(SFTDataset):
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
             tmp.write(ctrl_bytes)
             tmp.flush()
-            frames = list(ffmpeg_decode_video(tmp.name, scale_hw=resize_hw, num_threads=2))
+            frames = list(
+                ffmpeg_decode_video(
+                    tmp.name,
+                    scale_hw=resize_hw,
+                    num_threads=2,
+                    scale_flags="neighbor" if self.control_type == "seg" else "bicubic+accurate_rnd",
+                )
+            )
         ctrl = np.stack(frames, axis=0)  # [T_full, H, W, 3]
         chunk = []
         for idx in range(ctrl.shape[0]):
@@ -206,8 +214,10 @@ class TransferSFTDataset(SFTDataset):
             except Exception as exc:
                 log.warning(f"Failed to load control for {metadata['uuid']}: {exc}")
                 return None
-            if control_np.shape[0] == 0 or control_np.shape[0] != T:
-                log.warning(f"Control/target frame count mismatch for {metadata['uuid']}: {control_np.shape[0]} vs {T}")
+            if control_np.shape != target_np.shape:
+                log.warning(
+                    f"Control/target geometry mismatch for {metadata['uuid']}: {control_np.shape} vs {target_np.shape}"
+                )
                 return None
 
         control_tensor = _normalize(control_np)  # [3, T, H, W] float32 [-1, 1]
@@ -317,6 +327,12 @@ def get_transfer_sft_dataset(
     min_short_edge: int = 0,
     conditioning_config: dict[int, float] | None = None,
     temporal_compression_factor: int = 4,
+    max_caption_tokens: int = 2048,
+    cfg_dropout_keep_metadata: bool = False,
+    caption_suffix: str = "",
+    conditioning_fps: float = -1,
+    conditioning_fps_noise_std: float = 0.0,
+    sample_by_window: bool = False,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -326,7 +342,7 @@ def get_transfer_sft_dataset(
             produced by ``curator_to_sft_jsonl.py --control-type <type>``.
             Multiple files are concatenated; uuids are prefixed to avoid collisions.
         resolution: Output resolution bucket, e.g. ``"480"`` or ``"720"``.
-        num_video_frames: Frames per clip (≥ 61 to pass the converter hard filter).
+        num_video_frames: Frames per clip, or -1 for a manifest-defined window.
         control_type: ``"edge"`` | ``"blur"`` | ``"depth"`` | ``"seg"``.
             Edge and blur are computed on-the-fly; depth and seg require
             ``control_path`` entries in the JSONL.
@@ -363,13 +379,20 @@ def get_transfer_sft_dataset(
             _load_transfer_metadata(
                 s3_client,
                 jsonl_url,
-                min_frames=61,
+                min_frames=num_video_frames if num_video_frames > 0 else 1,
                 uuid_prefix=prefix,
                 min_short_edge=min_short_edge,
                 control_type=control_type,
             )
         )
 
+    if sample_by_window:
+        metadata_list = [
+            {**record, "uuid": f"{record['uuid']}_w{index}", "t2w_windows": [window]}
+            for record in metadata_list
+            for index, window in enumerate(record["t2w_windows"])
+        ]
+    metadata_list.sort(key=lambda record: hashlib.sha256(record["uuid"].encode()).hexdigest())
     total_windows = sum(len(m["t2w_windows"]) for m in metadata_list)
     log.info(
         f"Transfer SFT: {len(metadata_list)} videos, {total_windows} windows, "
@@ -391,4 +414,44 @@ def get_transfer_sft_dataset(
         append_resolution_info=append_resolution_info,
         conditioning_config=conditioning_config,
         temporal_compression_factor=temporal_compression_factor,
+        max_caption_tokens=max_caption_tokens,
+        cfg_dropout_keep_metadata=cfg_dropout_keep_metadata,
+        caption_suffix=caption_suffix,
+        conditioning_fps=conditioning_fps,
+        conditioning_fps_noise_std=conditioning_fps_noise_std,
     )
+
+
+class TransferSFTMapDataset(torch.utils.data.Dataset):
+    """Expose paired window records to the upstream resumable ``MapDistributor``.
+
+    The legacy iterable owns shuffling and rank partitioning itself and has no
+    checkpoint cursor. This adapter deliberately calls only its sample processor;
+    ``MapDistributor`` owns the order, sharding and saved cursor. Use zero workers
+    for replay: the trainer's DCP RNG snapshot then includes caption/conditioning
+    sampling as well as denoising. Multi-worker RNG replay is not supported here.
+    """
+
+    def __init__(self, source: TransferSFTDataset) -> None:
+        if not source.metadata:
+            raise ValueError("Paired SFT requires at least one eligible window")
+        self.source = source
+        self.source.s3_client = boto3.client("s3", **source.s3_credentials, config=client_config)
+
+    def __len__(self) -> int:
+        return len(self.source.metadata)
+
+    def __getitem__(self, index: int) -> dict:
+        if torch.utils.data.get_worker_info() is not None:
+            raise RuntimeError("Replayable paired SFT requires num_workers=0; worker RNG is not checkpointed")
+        metadata = self.source.metadata[index]
+        sample = self.source.process_one_sample(metadata)
+        if sample is None:
+            raise RuntimeError(f"Frozen paired training sample failed to decode: {metadata['uuid']}")
+        return sample
+
+
+def get_transfer_sft_map_dataset(**kwargs) -> TransferSFTMapDataset:
+    """Build explicit per-window pairs without a second iterable shuffle/shard."""
+    kwargs["sample_by_window"] = True
+    return TransferSFTMapDataset(get_transfer_sft_dataset(**kwargs))

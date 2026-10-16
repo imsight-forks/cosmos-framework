@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 # Maps ``job.task`` to the base Hydra config that ``make_config()`` lives in.
 TASK_TO_BASE_CONFIG: dict[str, str] = {
     "vfm": "cosmos_framework/configs/base/config.py",
@@ -131,6 +130,7 @@ def build_hydra_overrides(toml_dict: dict) -> list[str]:
     job = dict(toml_dict.get("job", {}))
     task = job.pop("task", "vfm")
     experiment_name = job.pop("experiment", None)
+    job.pop("experiment_module", None)
     if not experiment_name:
         raise ValueError("[job].experiment is required in the TOML")
     overrides.append(f"experiment={experiment_name}")

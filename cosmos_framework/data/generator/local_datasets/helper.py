@@ -92,14 +92,18 @@ def get_video_metadata(video_path: str) -> dict:
 
 
 def ffmpeg_decode_video(
-    video_path: str, scale_hw: tuple[int, int] | None = None, num_threads: int = 1
+    video_path: str,
+    scale_hw: tuple[int, int] | None = None,
+    num_threads: int = 1,
+    scale_flags: str = "bicubic+accurate_rnd",
 ) -> Generator[np.ndarray, None, None]:
     """
     Decode video frames using ffmpeg and yield HWC uint8 RGB frames.
 
     Args:
         video_path: Path to the video file
-        scale_hw: Tuple of width and height to scale the video to (default: None)
+        scale_hw: Tuple of height and width to scale the video to (default: None)
+        scale_flags: FFmpeg swscale flags; segmentation controls require ``neighbor``.
 
     Yields:
         np.ndarray: HWC uint8 RGB frames
@@ -136,7 +140,7 @@ def ffmpeg_decode_video(
         "-pix_fmt",
         "rgb24",
         "-sws_flags",
-        "bicubic+accurate_rnd",  # lanczos too much ringing on graphics
+        scale_flags,  # lanczos has too much ringing on graphics
         *(["-vf", f"scale={scale_hw[1]}:{scale_hw[0]}"] if scale_hw else []),  # WH
         "-f",
         "rawvideo",

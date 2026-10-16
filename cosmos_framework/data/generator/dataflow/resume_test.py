@@ -33,6 +33,7 @@ def _build(seed=0):
         processor=IdentityProcessor(),
         batch_size=1,
         num_workers=0,
+        seed=seed,
     )
 
 
@@ -56,3 +57,28 @@ def test_resume_continues_without_dup_or_skip():
     it2 = iter(loader2)  # one iterator: env-var fast-forward happens once, then continues
     resumed = [next(it2)["id"].item() for _ in range(3)]
     assert resumed == [5, 6, 7]
+
+
+def test_restart_iterator_preserves_trainer_rng_and_next_sample(monkeypatch):
+    """Cursor restoration must preserve the next diffusion-noise draw too."""
+    torch.manual_seed(132)
+    callback = CosmosDataLoaderStateCallback()
+    iterator = iter(_build(seed=42))
+    for _ in range(5):
+        batch = next(iterator)
+        callback._update_state_from_batch(batch)
+        torch.randn(11)  # The trainer consumes noise between loader draws.
+    cursor = callback.state_dict()
+    rng = torch.get_rng_state()
+    expected_id = next(iterator)["id"].item()
+    expected_noise = torch.randn(11)
+
+    restored_callback = CosmosDataLoaderStateCallback()
+    # Scope the callback's environment writes to this test.
+    monkeypatch.setenv("COSMOS_DL_STATE_WORKER_0_EPOCH", "0")
+    monkeypatch.setenv("COSMOS_DL_STATE_WORKER_0_INDEX", "-1")
+    restored_callback.load_state_dict(cursor)
+    torch.set_rng_state(rng)
+    restarted = iter(_build(seed=42))
+    assert next(restarted)["id"].item() == expected_id
+    assert torch.equal(torch.randn(11), expected_noise)

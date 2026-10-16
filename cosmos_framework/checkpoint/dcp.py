@@ -47,6 +47,7 @@ import queue
 import re
 import socket
 import time
+import traceback
 from datetime import timedelta
 from multiprocessing import get_context
 from typing import Any, Dict, Optional, Protocol, Tuple, Union, runtime_checkable
@@ -62,13 +63,14 @@ from torch.distributed.checkpoint.metadata import (
     Metadata,
     StorageMeta,
 )
-from torch.distributed.checkpoint.planner import LoadPlan
+from torch.distributed.checkpoint.planner import LoadPlan, SavePlan, SavePlanner
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
     set_model_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.checkpoint.storage import WriteResult
 from torch.distributed.tensor import DTensor, Replicate
 from torch.nn.modules.module import _IncompatibleKeys
 
@@ -83,6 +85,26 @@ from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, log, misc
 from cosmos_framework.utils.easy_io import easy_io
 from cosmos_framework.utils.generator.rand_state import get_rand_state_dict, set_rand_state_dict
+
+
+class _TracebackFileSystemWriter(FileSystemWriter):
+    """Retain the original local write failure before DCP gathers exceptions."""
+
+    def write_data(
+        self, plan: SavePlan, planner: SavePlanner
+    ) -> torch.futures.Future[list[WriteResult]]:
+        try:
+            future = super().write_data(plan, planner)
+            future.wait()
+            return future
+        except BaseException:
+            # Plain text avoids serializing traceback frames or inspecting GPU
+            # tensor values while reporting an already failed CUDA operation.
+            log.error(
+                f"Local DCP write failed for {self.path}\n{traceback.format_exc()}",
+                rank0_only=False,
+            )
+            raise
 
 
 class ModelWrapper(Stateful):
@@ -1150,7 +1172,10 @@ class DistributedCheckpointer(AbstractCheckpointer):
                 path=checkpoint_path,
                 enable_gcs_patch_in_boto3=self.config_checkpoint.enable_gcs_patch_in_boto3,
             )
-        return FileSystemWriter(path=checkpoint_path)
+        copy_ahead = getattr(self.config_checkpoint, "dcp_per_thread_copy_ahead", None)
+        if copy_ahead is None:
+            return FileSystemWriter(path=checkpoint_path)
+        return _TracebackFileSystemWriter(path=checkpoint_path, per_thread_copy_ahead=copy_ahead)
 
     def get_storage_reader(
         self,

@@ -8,6 +8,8 @@ This directory contains:
 - `launch_sft_*.sh` — paired launch shells. Each declares `TOML_FILE` plus `: "${DATASET_PATH:=…}"` / `: "${BASE_CHECKPOINT_PATH:=…}"` defaults (full repo-relative paths, matching what [`docs/training.md`](../docs/training.md) shows) and sources [`_sft_launcher_common.sh`](./_sft_launcher_common.sh), which sets the `torchrun` flags and forwards into `cosmos_framework.scripts.train`. `export`ing those vars in your shell before launching wins over the defaults; otherwise just run the shell after Steps 1+2 of `docs/training.md`.
 - `inference.py`, `inference_pipeline.py` — runnable inference helpers; see [docs/inference.md](../docs/inference.md).
 
+The explicit paired Nano segmentation LoRA qualification recipe is [`toml/sft_config/segmentation_sft_nano.toml`](toml/sft_config/segmentation_sft_nano.toml). Its data contract, native checkpoint conversion, environment variables, and recovery limits are documented in [paired segmentation LoRA](../docs/paired-segmentation-lora.md).
+
 ## Recipe → launch shell
 
 | Recipe                                       | Launch shell                          |

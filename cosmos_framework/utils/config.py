@@ -273,6 +273,18 @@ class CheckpointConfig:
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
 
+    # Optional local synchronous FileSystemWriter GPU-to-CPU copy-ahead bytes.
+    # None preserves the writer defaults; zero selects its serial CPU loader.
+    # This does not change the async producer's pinned-memory staging.
+    dcp_per_thread_copy_ahead: Optional[int] = attrs.field(default=None)
+
+    @dcp_per_thread_copy_ahead.validator
+    def _validate_dcp_per_thread_copy_ahead(
+        self, attribute: attrs.Attribute, value: Optional[int]
+    ) -> None:
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"{attribute.name} must be None or a nonnegative integer")
+
     # For dcp load, whether to deduplicate redundant storage reads of replicated state and
     # broadcast the data over the (NCCL) device mesh instead. Two replication patterns waste
     # reads at large world sizes: (1) fully-replicated entries (e.g. optimizer scalar `step`

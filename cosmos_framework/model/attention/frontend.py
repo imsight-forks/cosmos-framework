@@ -8,6 +8,7 @@ Unified implementation for all Attention implementations.
 Frontend APIs
 """
 
+import os
 from math import prod
 
 import torch
@@ -149,6 +150,7 @@ def attention(
             not None).
 
         deterministic (bool): Whether to enforce deterministic backward pass. Default is False.
+            FLASH_ATTENTION_DETERMINISTIC=1 also enables this flag.
             When True, backends are selected based on deterministic support.
 
     Returns:
@@ -161,6 +163,9 @@ def attention(
             not be made contiguous unless we can guarantee its results aren't merged via
             `merge_attentions`.
     """
+
+    # Resolve the launch-time opt-in before backend selection and dispatch.
+    deterministic = deterministic or os.environ.get("FLASH_ATTENTION_DETERMINISTIC") == "1"
 
     assert universal_tensor_checks(query=query, key=key, value=value, raise_error=True)
 

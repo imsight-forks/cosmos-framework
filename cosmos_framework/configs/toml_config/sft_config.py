@@ -52,6 +52,15 @@ class JobConfig(BaseModel):
             "(e.g. 'vision_sft_nano')."
         ),
     )
+    experiment_module: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "META — register only this Python experiment module when provided. "
+            "Passed to the existing config-factory experiment_module interface; "
+            "omitting it preserves the complete shipped experiment catalog."
+        ),
+    )
     project: str = Field(
         default="",
         description=(
@@ -596,6 +605,16 @@ class CheckpointConfig(BaseModel):
 
     model_config = _PYDANTIC_MODEL_CONFIG
 
+    dcp_per_thread_copy_ahead: Optional[int] = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        description=(
+            "Local synchronous DCP writer copy-ahead bytes. None preserves its "
+            "defaults; zero selects serial CPU staging. Does not change the "
+            "async producer's pinned-memory staging."
+        ),
+    )
     keys_to_skip_loading: list[str] = Field(
         default_factory=list,
         description=(
@@ -768,7 +787,7 @@ def load_experiment_from_toml(
     # Import lazily so this module stays cheap to import in non-training contexts.
     from cosmos_framework.utils.config import load_config
 
-    config = load_config(base_config_path, overrides)
+    config = load_config(base_config_path, overrides, experiment_module=cfg.job.experiment_module)
 
     # Inject [custom] verbatim after Hydra resolution. Kept off the base config
     # schema so the framework-owned hydra configs stay untouched; lands as a
