@@ -165,6 +165,8 @@ class TransferSFTDataset(SFTDataset):
         return arr[:, crop_y : crop_y + target_h, crop_x : crop_x + target_w]
 
     def process_one_sample(self, metadata: dict) -> dict | None:
+        if "source_view" in metadata:
+            return self._process_source_view(metadata)
         sample = super().process_one_sample(metadata)
         if sample is None:
             return None
@@ -220,6 +222,10 @@ class TransferSFTDataset(SFTDataset):
                 )
                 return None
 
+        return self._pair_sample(sample, control_np, target_np)
+
+    @staticmethod
+    def _pair_sample(sample, control_np, target_np):
         control_tensor = _normalize(control_np)  # [3, T, H, W] float32 [-1, 1]
         target_tensor = _normalize(target_np)  # [3, T, H, W] float32 [-1, 1]
 
@@ -240,6 +246,85 @@ class TransferSFTDataset(SFTDataset):
         sample["image_size"] = [sample["image_size"], sample["image_size"]]
 
         return sample
+
+    def _process_source_view(self, metadata: dict) -> dict:
+        """Bypass legacy download/index/crop for an already frozen pixel view."""
+        if torch.utils.data.get_worker_info() is not None:
+            raise RuntimeError("Replayable source-view paired SFT requires num_workers=0")
+        try:
+            from datagen_aigc_render.video_samples.training import (
+                SourceViewTrainingBindings,
+                SourceViewTrainingRecord,
+                open_source_view_pair,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "Source-view loading requires the compatible installed datagen-aigc-render package; "
+                "install the product wheel in this Cosmos runtime"
+            ) from exc
+        record = SourceViewTrainingRecord.model_validate(metadata["source_view"])
+        bindings = SourceViewTrainingBindings.model_validate(metadata["source_bindings"])
+        if self.num_video_frames not in (-1, record.declaration.frame_count):
+            raise ValueError(f"sample {record.sample_id}: configured frame count would reinterpret frozen view")
+        if (record.declaration.frame_count - 1) % self.temporal_compression_factor:
+            raise ValueError(f"sample {record.sample_id}: temporal compression would truncate frozen view")
+        expected_control = {
+            "stable-instance": "seg",
+            "binary-person": "seg",
+            "display-depth": "depth",
+            "blurred-rgb": "blur",
+        }.get(record.control_kind, record.control_kind)
+        if self.control_type != expected_control:
+            raise ValueError(f"sample {record.sample_id}: configured control type differs from frozen parent")
+        with open_source_view_pair(record, bindings) as pair:
+            video = torch.from_numpy(np.ascontiguousarray(pair.target.transpose(3, 0, 1, 2)))
+            sample = self._build_sample(
+                metadata,
+                metadata["t2w_windows"][0],
+                0,
+                video,
+                pair.fps,
+                record.declaration.frame_count,
+                0,
+                record.declaration.frame_count - 1,
+                1,
+                pair.fps,
+            )
+            if sample is None:
+                raise ValueError(f"sample {record.sample_id}: frozen caption cannot be loaded")
+            sample["source_view_fingerprint"] = record.semantic_fingerprint
+            sample["source_realization_fingerprint"] = record.realization.semantic_fingerprint
+            return self._pair_sample(sample, pair.control, pair.target)
+
+
+def _source_view_metadata(record: dict) -> dict:
+    try:
+        from datagen_aigc_render.video_samples.training import (
+            SourceViewTrainingBindings,
+            SourceViewTrainingRecord,
+        )
+    except ImportError as exc:
+        raise RuntimeError("Source-view rows require the installed compatible datagen-aigc-render package") from exc
+    frozen = SourceViewTrainingRecord.model_validate(record["source_view"])
+    SourceViewTrainingBindings.model_validate(record["source_bindings"])
+    if record["uuid"] != frozen.sample_id:
+        raise ValueError(f"source-view row UUID differs from frozen sample {frozen.sample_id}")
+    declaration = frozen.declaration
+    caption_key = (
+        "caption_json" if isinstance(frozen.caption, dict) or frozen.caption_format == "structured-json" else "caption"
+    )
+    return {
+        "uuid": frozen.sample_id,
+        "vision_path": f"source-view:{frozen.sample_id}",
+        "width": declaration.output_width,
+        "height": declaration.output_height,
+        "nb_frames": declaration.frame_count,
+        "framerate": float(declaration.effective_rate.as_fraction()),
+        "aspect_ratio": get_aspect_ratio(declaration.output_width, declaration.output_height),
+        "t2w_windows": [{"start_frame": 0, "end_frame": declaration.frame_count - 1, caption_key: frozen.caption}],
+        "source_view": frozen.model_dump(mode="json"),
+        "source_bindings": record["source_bindings"],
+    }
 
 
 def _load_transfer_metadata(
@@ -270,6 +355,9 @@ def _load_transfer_metadata(
             num_raw += 1
             record = json.loads(line.decode("utf-8"))
             uuid = f"{uuid_prefix}{record['uuid']}" if uuid_prefix else record["uuid"]
+            if "source_view" in record:
+                metadata_list.append(_source_view_metadata(record))
+                continue
 
             if record["duration"] > 61.0:
                 continue
@@ -333,6 +421,8 @@ def get_transfer_sft_dataset(
     conditioning_fps: float = -1,
     conditioning_fps_noise_std: float = 0.0,
     sample_by_window: bool = False,
+    source_view_dataset_fingerprint: str | None = None,
+    source_view_loader_revision: str | None = None,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -370,7 +460,11 @@ def get_transfer_sft_dataset(
     else:
         credentials = {}
 
-    s3_client = boto3.client("s3", **credentials, config=client_config)
+    s3_client = (
+        boto3.client("s3", **credentials, config=client_config)
+        if any(path.startswith("s3://") for path in jsonl_paths)
+        else None
+    )
 
     metadata_list: list[dict] = []
     for idx, jsonl_url in enumerate(jsonl_paths):
@@ -386,7 +480,25 @@ def get_transfer_sft_dataset(
             )
         )
 
-    if sample_by_window:
+    source_rows = [record for record in metadata_list if "source_view" in record]
+    if source_rows:
+        from datagen_aigc_render.video_samples.training import (
+            SOURCE_VIEW_LOADER_REVISION,
+            SourceViewTrainingRecord,
+            source_view_dataset_identity,
+        )
+
+        if len(source_rows) != len(metadata_list):
+            raise ValueError("Encoded and source-view representations require separate dataset identities")
+        identity = source_view_dataset_identity(
+            tuple(SourceViewTrainingRecord.model_validate(record["source_view"]) for record in source_rows)
+        )
+        if source_view_dataset_fingerprint != identity or source_view_loader_revision != SOURCE_VIEW_LOADER_REVISION:
+            raise ValueError(
+                "Source-view dataset/loader identity differs or is missing; incompatible resume is forbidden"
+            )
+
+    if sample_by_window and not source_rows:
         metadata_list = [
             {**record, "uuid": f"{record['uuid']}_w{index}", "t2w_windows": [window]}
             for record in metadata_list
@@ -436,7 +548,11 @@ class TransferSFTMapDataset(torch.utils.data.Dataset):
         if not source.metadata:
             raise ValueError("Paired SFT requires at least one eligible window")
         self.source = source
-        self.source.s3_client = boto3.client("s3", **source.s3_credentials, config=client_config)
+        self.source.s3_client = (
+            None
+            if all("source_view" in record for record in source.metadata)
+            else boto3.client("s3", **source.s3_credentials, config=client_config)
+        )
 
     def __len__(self) -> int:
         return len(self.source.metadata)

@@ -280,10 +280,36 @@ class SFTDataset(torch.utils.data.IterableDataset):
         # THWC -> CTHW
         video_chunk = np.transpose(video_chunk, (3, 0, 1, 2))  # [3,T,H,W]
         video = torch.from_numpy(np.ascontiguousarray(video_chunk)).to(torch.uint8)  # [3,T,H,W]
-        padding_mask = torch.zeros((1, target_h, target_w), dtype=torch.float32)
-        # image_size: [target_h, target_w, orig_h, orig_w] in pixel space, for the model to crop the video
-        image_size = torch.tensor([target_h, target_w, target_h, target_w], dtype=torch.float32)
+        return self._build_sample(
+            metadata,
+            t2w_window,
+            win_idx,
+            video,
+            original_fps,
+            total_frames,
+            start_frame,
+            end_frame,
+            temporal_interval,
+            fps,
+        )
 
+    def _build_sample(
+        self,
+        metadata,
+        t2w_window,
+        win_idx,
+        video,
+        original_fps,
+        total_frames,
+        start_frame,
+        end_frame,
+        temporal_interval,
+        fps,
+    ):
+        """Apply the common caption/dropout/conditioning policy to frozen RGB."""
+        target_h, target_w = video.shape[-2:]
+        padding_mask = torch.zeros((1, target_h, target_w), dtype=torch.float32)
+        image_size = torch.tensor([target_h, target_w, target_h, target_w], dtype=torch.float32)
         selected = _select_caption(t2w_window)
         if selected is None:
             log.warning(
