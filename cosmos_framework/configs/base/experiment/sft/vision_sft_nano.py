@@ -419,6 +419,49 @@ segmentation_sft_nano.dataloader_train = L(CosmosDataLoader)(
 )
 
 
-for _item in [vision_sft_nano, vision_sft_nano_mapstyle_dataloader, segmentation_sft_nano]:
+# Canonical v2 views retain both parents and select the active control subset
+# once per MapDistributor exposure; the callback binds policy/counter to DCP.
+from cosmos_framework.callbacks.source_view_mode_state import SourceViewModeStateCallback
+from cosmos_framework.callbacks.source_view_smoke import SourceViewTrainingSmoke
+
+mixed_control_sft_nano = copy.deepcopy(segmentation_sft_nano)
+mixed_control_sft_nano.job.name = "mixed_control_sft_nano"
+mixed_control_sft_nano.dataloader_train.batcher.max_sequence_length = 67584
+mixed_control_sft_nano.dataloader_train.batcher.max_samples_per_batch = None
+mixed_control_sft_nano.model.config.max_num_tokens_after_packing = 67584
+mixed_control_sft_nano.dataloader_train.distributor.dataset.control_type = "mixed"
+mixed_control_sft_nano.dataloader_train.distributor.dataset.source_view_loader_revision = "dsgen-source-view-multi-v2"
+mixed_control_sft_nano.dataloader_train.distributor.dataset.source_view_dataset_fingerprint = (
+    "${oc.env:SOURCE_VIEW_DATASET_FINGERPRINT}"
+)
+mixed_control_sft_nano.dataloader_train.distributor.dataset.source_view_execution_fingerprint = (
+    "${oc.env:SOURCE_VIEW_EXECUTION_FINGERPRINT}"
+)
+mixed_control_sft_nano.dataloader_train.distributor.dataset.conditioning_mixture = {
+    "revision": "sha256-exposure-v1",
+    "seed": 42,
+    "weights": [1, 1, 1],
+}
+mixed_control_sft_nano.trainer.callbacks.dataloader_state = L(SourceViewModeStateCallback)(
+    execution_fingerprint="${oc.env:SOURCE_VIEW_EXECUTION_FINGERPRINT}"
+)
+
+mixed_control_smoke_nano = copy.deepcopy(mixed_control_sft_nano)
+mixed_control_smoke_nano.job.name = "mixed_control_smoke_nano"
+mixed_control_smoke_nano.trainer.max_iter = 6
+mixed_control_smoke_nano.dataloader_train.distributor.shuffle = False
+mixed_control_smoke_nano.checkpoint.save_iter = 6
+mixed_control_smoke_nano.dataloader_train.distributor.dataset.cfg_dropout_rate = 0.0
+mixed_control_smoke_nano.trainer.callbacks.generation_lora_audit = L(SourceViewTrainingSmoke)(
+    evidence_dir="${oc.env:LORA_AUDIT_DIR}", max_updates=6
+)
+
+for _item in [
+    vision_sft_nano,
+    vision_sft_nano_mapstyle_dataloader,
+    segmentation_sft_nano,
+    mixed_control_sft_nano,
+    mixed_control_smoke_nano,
+]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

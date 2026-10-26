@@ -23,9 +23,7 @@ class IterableDistributor(DataDistributor):
     def __init__(self, iterable: Any):
         self._iterable = iterable
 
-    def stream(
-        self, dp_rank: int, dp_world_size: int, worker_id: int, num_workers: int
-    ) -> Iterator[Any]:
+    def stream(self, dp_rank: int, dp_world_size: int, worker_id: int, num_workers: int) -> Iterator[Any]:
         total_streams = dp_world_size * num_workers
         my_stream = dp_rank * num_workers + worker_id
         for i, item in enumerate(self._iterable):
@@ -78,7 +76,9 @@ class MapDistributor(DataDistributor):
             stream_slice = perm[stream_id::total_streams]
             start = (resume_pos + 1) if epoch == resume_epoch else 0
             for pos in range(start, len(stream_slice)):
-                item = self._dataset[stream_slice[pos]]
+                exposure = epoch * n + stream_id + pos * total_streams
+                getter = getattr(self._dataset, "get_exposure", None)
+                item = getter(stream_slice[pos], exposure) if getter is not None else self._dataset[stream_slice[pos]]
                 if isinstance(item, dict):
                     yield {"_dp_epoch": epoch, "_dp_stream_pos": pos, **item}
                 else:

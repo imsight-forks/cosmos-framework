@@ -117,11 +117,17 @@ class TransferSFTDataset(SFTDataset):
         self,
         *args,
         control_type: str = "edge",
+        conditioning_mixture: dict | None = None,
+        source_view_execution_fingerprint: str | None = None,
         **kwargs,
     ):
-        assert control_type in _ON_THE_FLY_CONTROLS | _PRECOMPUTED_CONTROLS, f"Unknown control_type={control_type!r}"
+        assert control_type in _ON_THE_FLY_CONTROLS | _PRECOMPUTED_CONTROLS | {"depth-seg", "mixed"}, (
+            f"Unknown control_type={control_type!r}"
+        )
         super().__init__(*args, **kwargs)
         self.control_type = control_type
+        self.conditioning_mixture = conditioning_mixture
+        self.source_view_execution_fingerprint = source_view_execution_fingerprint
 
     def _load_precomputed_control(
         self,
@@ -262,6 +268,8 @@ class TransferSFTDataset(SFTDataset):
                 "Source-view loading requires the compatible installed datagen-aigc-render package; "
                 "install the product wheel in this Cosmos runtime"
             ) from exc
+        if metadata["source_view"].get("schema_version", 1) == 2:
+            return self._process_source_view_multi(metadata)
         record = SourceViewTrainingRecord.model_validate(metadata["source_view"])
         bindings = SourceViewTrainingBindings.model_validate(metadata["source_bindings"])
         if self.num_video_frames not in (-1, record.declaration.frame_count):
@@ -296,6 +304,71 @@ class TransferSFTDataset(SFTDataset):
             sample["source_realization_fingerprint"] = record.realization.semantic_fingerprint
             return self._pair_sample(sample, pair.control, pair.target)
 
+    def _process_source_view_multi(self, metadata: dict) -> dict:
+        from datagen_aigc_render.video_samples.training_multi import (
+            MODE_CONTROLS,
+            ConditioningMixturePolicy,
+            SourceViewTrainingBindingsV2,
+            SourceViewTrainingRecordV2,
+            open_source_view_multi,
+        )
+
+        record = SourceViewTrainingRecordV2.model_validate(metadata["source_view"])
+        bindings = SourceViewTrainingBindingsV2.model_validate(metadata["source_bindings"])
+        if self.num_video_frames not in (-1, record.declaration.frame_count):
+            raise ValueError(f"sample {record.sample_id}: configured frame count differs")
+        if (record.declaration.frame_count - 1) % self.temporal_compression_factor:
+            raise ValueError(f"sample {record.sample_id}: temporal compression would truncate frozen view")
+        if self.conditioning_fps != -1 or self.conditioning_fps_noise_std != 0:
+            raise ValueError("Version-two source views require exact conditioning_fps=-1 and no FPS noise")
+        if self.control_type == "mixed":
+            if record.control_kinds != ("depth", "seg"):
+                raise ValueError(f"sample {record.sample_id}: mixed training requires both saved parents")
+            if "conditioning_exposure" not in metadata:
+                raise ValueError("Mixed training requires MapDistributor exposure identity")
+            policy = ConditioningMixturePolicy.model_validate(self.conditioning_mixture or {})
+            mode = policy.select(record.sample_id, metadata["conditioning_exposure"])
+        else:
+            mode = self.control_type
+            if mode not in MODE_CONTROLS or MODE_CONTROLS[mode] != record.control_kinds:
+                raise ValueError(f"sample {record.sample_id}: configured control set differs from frozen parent")
+        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode]) as pair:
+            video = torch.from_numpy(np.ascontiguousarray(pair.target.transpose(3, 0, 1, 2)))
+            sample = self._build_sample(
+                metadata,
+                metadata["t2w_windows"][0],
+                0,
+                video,
+                pair.fps,
+                record.declaration.frame_count,
+                0,
+                record.declaration.frame_count - 1,
+                1,
+                pair.fps,
+            )
+            if sample is None:
+                raise ValueError(f"sample {record.sample_id}: frozen caption cannot be loaded")
+            controls = [_normalize(pair.controls[kind]) for kind in MODE_CONTROLS[mode]]
+            sample["video"] = [*controls, _normalize(pair.target)]
+            sample["image_size"] = [sample["image_size"]] * len(sample["video"])
+            cond = sample["sequence_plan"].condition_frame_indexes_vision if "sequence_plan" in sample else []
+            sample["sequence_plan"] = SequencePlan(
+                has_text=True,
+                has_vision=True,
+                condition_frame_indexes_vision=cond,
+                share_vision_temporal_positions=True,
+            )
+            sample["dataset_name"] = "video_transfer"
+            sample["selected_caption_type"] = "transfer_caption"
+            sample["conditioning_mode"] = mode
+            sample["conditioning_stream_roles"] = ",".join((*MODE_CONTROLS[mode], "target"))
+            sample["conditioning_exposure"] = metadata.get("conditioning_exposure", 0)
+            sample["conditioning_execution_fingerprint"] = self.source_view_execution_fingerprint or "single-mode"
+            sample["source_view_fingerprint"] = record.semantic_fingerprint
+            sample["source_realization_fingerprint"] = record.realization.semantic_fingerprint
+            sample["source_effective_rate"] = f"{pair.effective_rate.numerator}/{pair.effective_rate.denominator}"
+            return sample
+
 
 def _source_view_metadata(record: dict) -> dict:
     try:
@@ -305,8 +378,17 @@ def _source_view_metadata(record: dict) -> dict:
         )
     except ImportError as exc:
         raise RuntimeError("Source-view rows require the installed compatible datagen-aigc-render package") from exc
-    frozen = SourceViewTrainingRecord.model_validate(record["source_view"])
-    SourceViewTrainingBindings.model_validate(record["source_bindings"])
+    if record["source_view"].get("schema_version", 1) == 2:
+        from datagen_aigc_render.video_samples.training_multi import (
+            SourceViewTrainingRecordV2,
+            SourceViewTrainingBindingsV2,
+        )
+
+        frozen = SourceViewTrainingRecordV2.model_validate(record["source_view"])
+        SourceViewTrainingBindingsV2.model_validate(record["source_bindings"])
+    else:
+        frozen = SourceViewTrainingRecord.model_validate(record["source_view"])
+        SourceViewTrainingBindings.model_validate(record["source_bindings"])
     if record["uuid"] != frozen.sample_id:
         raise ValueError(f"source-view row UUID differs from frozen sample {frozen.sample_id}")
     declaration = frozen.declaration
@@ -423,6 +505,8 @@ def get_transfer_sft_dataset(
     sample_by_window: bool = False,
     source_view_dataset_fingerprint: str | None = None,
     source_view_loader_revision: str | None = None,
+    conditioning_mixture: dict | None = None,
+    source_view_execution_fingerprint: str | None = None,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -490,14 +574,41 @@ def get_transfer_sft_dataset(
 
         if len(source_rows) != len(metadata_list):
             raise ValueError("Encoded and source-view representations require separate dataset identities")
-        identity = source_view_dataset_identity(
-            tuple(SourceViewTrainingRecord.model_validate(record["source_view"]) for record in source_rows)
-        )
-        if source_view_dataset_fingerprint != identity or source_view_loader_revision != SOURCE_VIEW_LOADER_REVISION:
+        versions = {record["source_view"].get("schema_version", 1) for record in source_rows}
+        if len(versions) != 1:
+            raise ValueError("Source-view schema versions require separate dataset identities")
+        revision = SOURCE_VIEW_LOADER_REVISION
+        if versions == {2}:
+            from datagen_aigc_render.video_samples.training_multi import (
+                SOURCE_VIEW_MULTI_LOADER_REVISION,
+                ConditioningMixturePolicy,
+                SourceViewTrainingRecordV2,
+                source_view_multi_dataset_identity,
+                source_view_training_execution_identity,
+            )
+
+            identity = source_view_multi_dataset_identity(
+                tuple(SourceViewTrainingRecordV2.model_validate(record["source_view"]) for record in source_rows)
+            )
+            revision = SOURCE_VIEW_MULTI_LOADER_REVISION
+            if control_type == "mixed":
+                policy = ConditioningMixturePolicy.model_validate(conditioning_mixture or {})
+                expected_execution = source_view_training_execution_identity(identity, policy)
+                if source_view_execution_fingerprint != expected_execution:
+                    raise ValueError("Source-view mixed training execution/policy identity differs or is missing")
+        else:
+            identity = source_view_dataset_identity(
+                tuple(SourceViewTrainingRecord.model_validate(record["source_view"]) for record in source_rows)
+            )
+            if control_type in {"mixed", "depth-seg"}:
+                raise ValueError("Mixed/joint training requires version-two source-view rows")
+        if source_view_dataset_fingerprint != identity or source_view_loader_revision != revision:
             raise ValueError(
                 "Source-view dataset/loader identity differs or is missing; incompatible resume is forbidden"
             )
 
+    if not source_rows and control_type in {"mixed", "depth-seg"}:
+        raise ValueError("Mixed/joint control training requires canonical version-two source views")
     if sample_by_window and not source_rows:
         metadata_list = [
             {**record, "uuid": f"{record['uuid']}_w{index}", "t2w_windows": [window]}
@@ -517,6 +628,8 @@ def get_transfer_sft_dataset(
         resolution=resolution,
         s3_credentials=credentials,
         control_type=control_type,
+        conditioning_mixture=conditioning_mixture,
+        source_view_execution_fingerprint=source_view_execution_fingerprint,
         temporal_interval_mode=temporal_interval_mode,
         frame_selection_mode=frame_selection_mode,
         tokenizer_config=tokenizer_config,
@@ -556,6 +669,16 @@ class TransferSFTMapDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return len(self.source.metadata)
+
+    def get_exposure(self, index: int, exposure: int) -> dict:
+        """Select once from the distributor's immutable logical exposure counter."""
+        if torch.utils.data.get_worker_info() is not None:
+            raise RuntimeError("Replayable paired SFT requires num_workers=0")
+        metadata = {**self.source.metadata[index], "conditioning_exposure": exposure}
+        sample = self.source.process_one_sample(metadata)
+        if sample is None:
+            raise RuntimeError(f"Frozen paired sample failed: {metadata['uuid']}")
+        return sample
 
     def __getitem__(self, index: int) -> dict:
         if torch.utils.data.get_worker_info() is not None:

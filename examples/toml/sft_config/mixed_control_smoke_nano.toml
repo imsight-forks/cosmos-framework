@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Six-update canonical mixed-control smoke; no convergence qualification.
+[job]
+task = "vfm"
+experiment = "mixed_control_smoke_nano"
+experiment_module = "cosmos_framework.configs.base.experiment.sft.vision_sft_nano"
+project = "cosmos3"
+group = "mixed-control-lora-smoke"
+name = "qualification"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+lora_enabled = true
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = "q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen"
+
+[model.parallelism]
+data_parallel_shard_degree = -1
+data_parallel_replicate_degree = 1
+
+[model.compile]
+enabled = false
+
+[model.ema]
+enabled = false
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 1e-4
+betas = [0.9, 0.95]
+eps = 1e-6
+fused = true
+weight_decay = 0.0
+keys_to_select = ["lora_"]
+
+[scheduler]
+cycle_lengths = [6]
+warm_up_steps = [0]
+f_start = [1.0]
+f_max = [1.0]
+f_min = [1.0]
+
+[trainer]
+distributed_parallelism = "fsdp"
+grad_accum_iter = 1
+max_iter = 6
+logging_iter = 1
+
+[checkpoint]
+# Use the public serial CPU loader for this synchronous local checkpoint recipe.
+dcp_per_thread_copy_ahead = 0
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+keys_to_skip_loading = ["net_ema.", "lora_"]
+save_iter = 6
