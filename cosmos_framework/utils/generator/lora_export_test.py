@@ -4,6 +4,7 @@
 """CPU checks of the native adapter / actual Diffusers PEFT boundary."""
 
 import copy
+import json
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,50 @@ def export(native, path):
 class LoraExportTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(123)
+
+    def test_materialized_snapshot_uses_exact_gathered_values_and_coverage(self):
+        from safetensors.torch import load_file
+
+        native = native_projection_model(tiny_transformer())
+        state = {name: parameter.detach().clone() for name, parameter in native.named_parameters() if parameter.requires_grad}
+        with tempfile.TemporaryDirectory() as tmp:
+            kwargs = dict(base_binding=BINDING, training_view_sha256="2" * 64, update=1, source_identities={"source": "fixture"})
+            expected = next(value for name, value in state.items() if name.endswith("q_proj_moe_gen.lora_B.weight"))
+            with torch.no_grad():
+                native.model.layers[0].self_attn.q_proj_moe_gen.lora_B.weight.add_(1)
+            root = Path(tmp)
+            export_generation_lora(native, root / "snapshot", materialized_state=state, **kwargs)
+            actual = load_file(root / "snapshot/adapter_model.safetensors")
+            torch.testing.assert_close(actual["layers.0.self_attn.add_q_proj.lora_B.weight"], expected, rtol=0, atol=0)
+            with self.assertRaisesRegex(ValueError, "Missing materialized"):
+                export_generation_lora(native, root / "missing", materialized_state={}, **kwargs)
+            with self.assertRaisesRegex(ValueError, "exactly the generation adapters"):
+                export_generation_lora(native, root / "extra", materialized_state={**state, "unrelated": torch.ones(1)}, **kwargs)
+            self.assertFalse((root / "missing").exists())
+            self.assertFalse((root / "extra").exists())
+
+    def test_per_update_snapshots_preserve_model_and_rng_and_reject_duplicate_update(self):
+        from cosmos_framework.callbacks.generation_lora_snapshots import GenerationLoraSnapshots
+
+        native = native_projection_model(tiny_transformer())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = root / "binding.json"
+            binding.write_text(json.dumps({"base_binding": BINDING, "training_view_sha256": "2" * 64, "source_identities": {"source": "fixture"}}))
+            callback = GenerationLoraSnapshots(str(root / "snapshots"), str(binding))
+            callback.on_train_start(native)
+            initial = {name: p.detach().clone() for name, p in native.named_parameters()}
+            rng = torch.get_rng_state().clone()
+            callback.on_training_step_end(native, {}, {}, torch.tensor(1.0), iteration=1)
+            torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+            for name, p in native.named_parameters():
+                torch.testing.assert_close(p, initial[name], rtol=0, atol=0)
+            with self.assertRaisesRegex(ValueError, "consecutive optimizer updates"):
+                callback.on_training_step_end(native, {}, {}, torch.tensor(1.0), iteration=1)
+            callback.on_training_step_end(native, {}, {}, torch.tensor(1.0), iteration=2)
+            rows = [json.loads(line) for line in (root / "snapshots/index.jsonl").read_text().splitlines()]
+            self.assertEqual([row["update"] for row in rows], [1, 2])
+            self.assertTrue(all(Path(row["path"]).joinpath("training_manifest.json").exists() for row in rows))
 
     def test_exports_actual_activation_checkpoint_wrapped_layers(self):
         native = native_projection_model(tiny_transformer())

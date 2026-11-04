@@ -457,12 +457,24 @@ mixed_control_smoke_nano.trainer.callbacks.generation_lora_audit = L(SourceViewT
     evidence_dir="${oc.env:LORA_AUDIT_DIR}", max_updates=6
 )
 
+from cosmos_framework.callbacks.generation_lora_snapshots import GenerationLoraSnapshots
+
+mixed_control_progress_smoke_nano = copy.deepcopy(mixed_control_smoke_nano)
+mixed_control_progress_smoke_nano.job.name = "mixed_control_progress_smoke_nano"
+mixed_control_progress_smoke_nano.trainer.max_iter = 5
+mixed_control_progress_smoke_nano.checkpoint.save_iter = 5
+mixed_control_progress_smoke_nano.trainer.callbacks.generation_lora_audit.max_updates = 5
+mixed_control_progress_smoke_nano.trainer.callbacks.generation_lora_snapshots = L(GenerationLoraSnapshots)(
+    output_dir="${oc.env:LORA_SNAPSHOT_DIR}", binding_path="${oc.env:LORA_SNAPSHOT_BINDING}"
+)
+
 for _item in [
     vision_sft_nano,
     vision_sft_nano_mapstyle_dataloader,
     segmentation_sft_nano,
     mixed_control_sft_nano,
     mixed_control_smoke_nano,
+    mixed_control_progress_smoke_nano,
 ]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

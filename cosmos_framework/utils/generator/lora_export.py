@@ -66,11 +66,13 @@ def export_generation_lora(
     training_view_sha256: str,
     update: int,
     source_identities: Mapping[str, str],
+    materialized_state: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Publish an immutable, complete attention-only adapter directory.
 
-    Call on an unsharded/materialized model (or a gathered CPU replica), never
-    rank-local DTensors. The base digest binds the caller's canonical checkpoint
+    Pass a materialized model, or exact full LoRA tensors gathered from all
+    distributed ranks through ``materialized_state``. Rank-local shards are
+    never exported. The base digest binds the caller's canonical checkpoint
     manifest; callers must verify that manifest's payloads before loading base.
     """
     binding = _binding(base_binding)
@@ -87,6 +89,7 @@ def export_generation_lora(
     adapter_parameters: set[int] = set()
     scales: set[tuple[int, float]] = set()
     layers: dict[int, set[str]] = {}
+    selected_state_names: set[str] = set()
     for name, module in network.named_modules():
         if not isinstance(module, LoraInjectedLinear):
             continue
@@ -102,14 +105,19 @@ def export_generation_lora(
         layers.setdefault(int(layer), set()).add(projection)
         for side, expected in [("A", (rank, module.in_features)), ("B", (module.out_features, rank))]:
             parameter = getattr(module, f"lora_{side}").weight
-            if parameter.is_meta or hasattr(parameter, "to_local"):
+            state_name = f"{name}.lora_{side}.weight"
+            selected_state_names.add(state_name)
+            if materialized_state is not None and state_name not in materialized_state:
+                raise ValueError(f"Missing materialized adapter: {state_name}")
+            value = parameter if materialized_state is None else materialized_state[state_name]
+            if value.is_meta or hasattr(value, "to_local"):
                 raise ValueError(f"Gather adapter before export: {name}.lora_{side}")
-            if tuple(parameter.shape) != expected or not torch.isfinite(parameter).all():
+            if tuple(value.shape) != expected or not torch.isfinite(value).all():
                 raise ValueError(f"Invalid adapter shape/values: {name}.lora_{side}")
             key = f"{target}.lora_{side}.weight"
             if key in weights:
                 raise ValueError(f"Duplicate adapter mapping: {key}")
-            weights[key] = parameter.detach().cpu().contiguous().clone()
+            weights[key] = value.detach().cpu().contiguous().clone()
             adapter_parameters.add(id(parameter))
         mappings.append(
             {
@@ -123,6 +131,8 @@ def export_generation_lora(
         )
     if not weights or len(scales) != 1:
         raise ValueError("Export requires a nonempty adapter with uniform rank and alpha")
+    if materialized_state is not None and set(materialized_state) != selected_state_names:
+        raise ValueError("Materialized state must contain exactly the generation adapters")
     all_generation_modules = {
         name
         for name, module in network.named_modules()
