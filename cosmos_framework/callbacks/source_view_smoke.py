@@ -162,6 +162,9 @@ class SourceViewTrainingSmoke(GenerationLoraAudit):
                 "roles": data_batch.get("conditioning_stream_roles", []),
                 "exact_rates": data_batch.get("source_effective_rate", []),
                 "executions": data_batch.get("conditioning_execution_fingerprint", []),
+                "sample_ids": data_batch.get("__key__", data_batch.get("key", data_batch.get("uuid", []))),
+                "source_views": data_batch.get("source_view_fingerprint", []),
+                "exposures": [int(value) for value in data_batch.get("conditioning_exposure", [])],
             }
         )
 

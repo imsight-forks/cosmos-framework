@@ -44,11 +44,13 @@ class MapDistributor(DataDistributor):
         seed: int = 0,
         shuffle: bool = True,
         name: str = "",
+        pad_to_world_size: bool = False,
     ):
         self._dataset = dataset
         self._seed = seed
         self._shuffle = shuffle
         self._name = name
+        self._pad_to_world_size = pad_to_world_size
 
     def __len__(self) -> int:
         return len(self._dataset)  # type: ignore[arg-type]
@@ -61,8 +63,9 @@ class MapDistributor(DataDistributor):
         n = len(self._dataset)  # type: ignore[arg-type]
         if n == 0:
             return
-        if stream_id >= n:
+        if stream_id >= n and not self._pad_to_world_size:
             return
+        epoch_size = ((n + total_streams - 1) // total_streams) * total_streams if self._pad_to_world_size else n
         _pfx = f"COSMOS_DL_STATE_{self._name}_" if self._name else "COSMOS_DL_STATE_"
         resume_epoch = int(os.environ.pop(f"{_pfx}WORKER_{worker_id}_EPOCH", 0))
         resume_pos = int(os.environ.pop(f"{_pfx}WORKER_{worker_id}_INDEX", -1))
@@ -73,10 +76,14 @@ class MapDistributor(DataDistributor):
                 perm = torch.randperm(n, generator=g).tolist()
             else:
                 perm = list(range(n))
+            if self._pad_to_world_size:
+                # Explicit DistributedSampler-style padding keeps every rank active
+                # without adding synthetic sample identities to the source view.
+                perm = (perm * ((epoch_size + n - 1) // n))[:epoch_size]
             stream_slice = perm[stream_id::total_streams]
             start = (resume_pos + 1) if epoch == resume_epoch else 0
             for pos in range(start, len(stream_slice)):
-                exposure = epoch * n + stream_id + pos * total_streams
+                exposure = epoch * epoch_size + stream_id + pos * total_streams
                 getter = getattr(self._dataset, "get_exposure", None)
                 item = getter(stream_slice[pos], exposure) if getter is not None else self._dataset[stream_slice[pos]]
                 if isinstance(item, dict):

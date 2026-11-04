@@ -450,6 +450,7 @@ mixed_control_smoke_nano = copy.deepcopy(mixed_control_sft_nano)
 mixed_control_smoke_nano.job.name = "mixed_control_smoke_nano"
 mixed_control_smoke_nano.trainer.max_iter = 6
 mixed_control_smoke_nano.dataloader_train.distributor.shuffle = False
+mixed_control_smoke_nano.dataloader_train.distributor.pad_to_world_size = True
 mixed_control_smoke_nano.checkpoint.save_iter = 6
 mixed_control_smoke_nano.dataloader_train.distributor.dataset.cfg_dropout_rate = 0.0
 mixed_control_smoke_nano.trainer.callbacks.generation_lora_audit = L(SourceViewTrainingSmoke)(
