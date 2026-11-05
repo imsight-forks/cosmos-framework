@@ -241,6 +241,8 @@ class ImaginaireTrainer:
         super().__init__()
         self.config = config
         self._validation_iterator: Iterator[Any] | None = None
+        self._validation_requested_at: int | None = None
+        self._stop_after_checkpoint_at: int | None = None
         # Set up the distributed computing environment.
         with distributed_init():
             distributed.init()
@@ -523,7 +525,10 @@ class ImaginaireTrainer:
             log.info(f"Set SM carveout to {sm_carveout}")
         self.callbacks.on_train_start(model, iteration=iteration)
         # Initial validation.
-        if self.config.trainer.run_validation and iteration == 0 and self.config.trainer.run_validation_on_start:
+        if self.config.trainer.run_validation and (
+            (iteration == 0 and self.config.trainer.run_validation_on_start)
+            or (iteration > 0 and self.config.trainer.run_validation_on_resume)
+        ):
             self.validate(model, dataloader_val, iteration=iteration)
 
         if self.config.trainer.save_zero_checkpoint and iteration == 0:
@@ -543,12 +548,16 @@ class ImaginaireTrainer:
             maybe_enable_nsys_profiling(self.config, global_step=iteration) as nsys_profiler,
         ):
             while True:
-                if iteration >= self.config.trainer.max_iter:
+                if self._stop_after_checkpoint_at == iteration or (
+                    self.config.trainer.max_iter >= 0 and iteration >= self.config.trainer.max_iter
+                ):
                     break
                 dataloader_train_iter = iter(dataloader_train)
                 while True:
                     # If max_iter is reached, exit the training loop before loading the nex batch
-                    if iteration >= self.config.trainer.max_iter:
+                    if self._stop_after_checkpoint_at == iteration or (
+                        self.config.trainer.max_iter >= 0 and iteration >= self.config.trainer.max_iter
+                    ):
                         _end_training = True
                         break
                     self.callbacks.on_before_dataloading(iteration)
@@ -614,7 +623,11 @@ class ImaginaireTrainer:
                     # validation or the next training step. Callback-owned references remain valid.
                     del output_batch, loss
                     # Validation.
-                    if self.config.trainer.run_validation and iteration % self.config.trainer.validation_iter == 0:
+                    if self.config.trainer.run_validation and (
+                        iteration % self.config.trainer.validation_iter == 0
+                        or self._validation_requested_at == iteration
+                    ):
+                        self._validation_requested_at = None
                         self.validate(model, dataloader_val, iteration=iteration)
                     # This iteration is successful; reset the timeout signal.
                     signal.alarm(self.config.trainer.timeout_period)
@@ -631,7 +644,7 @@ class ImaginaireTrainer:
         log.success("Done with training.")
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
-        if iteration % self.config.checkpoint.save_iter != 0:
+        if iteration % self.config.checkpoint.save_iter != 0 and self._stop_after_checkpoint_at != iteration:
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()
@@ -729,6 +742,20 @@ class ImaginaireTrainer:
         """Zero gradients. Override to customise (e.g. PhaseOptimizer)."""
         optimizer.zero_grad(set_to_none=True)
 
+    def request_validation(self, iteration: int) -> None:
+        """Request native validation at a completed update without mutating frozen config."""
+        if type(iteration) is not int or iteration <= 0:
+            raise ValueError("Validation requests require a positive optimizer update")
+        if self._validation_requested_at not in (None, iteration):
+            raise ValueError("An earlier validation request has not been consumed")
+        self._validation_requested_at = iteration
+
+    def request_stop_after_checkpoint(self, iteration: int) -> None:
+        """Stop at a completed optimizer/checkpoint boundary after pending validation."""
+        if type(iteration) is not int or iteration <= 0:
+            raise ValueError("Stopping requires a completed positive optimizer update")
+        self._stop_after_checkpoint_at = iteration
+
     @torch.no_grad()
     def validate(self, model: ImaginaireModel, dataloader_val: torch.utils.data.DataLoader, iteration: int = 0) -> None:
         """Validate on at most the configured number of validation batches.
@@ -768,4 +795,7 @@ class ImaginaireTrainer:
                 output_batch, loss = model.validation_step(data_batch, iteration)
                 self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
                 val_iter += 1
+        if val_iter:
+            # End callbacks may generate previews; release full-size validation tensors first.
+            del data_batch, output_batch, loss
         self.callbacks.on_validation_end(model, iteration=iteration)

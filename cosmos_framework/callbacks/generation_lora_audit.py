@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.distributed.fsdp import FSDPModule
 
 from cosmos_framework.utils.callback import Callback
 from cosmos_framework.utils.generator.lora import LoraInjectedLinear
@@ -28,6 +29,13 @@ _ADAPTER_NAME = re.compile(
 def _fingerprint(parameter: torch.Tensor) -> str:
     value = get_local_tensor_if_DTensor(parameter.detach()).contiguous().cpu()
     return hashlib.sha256(value.reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def _reshard_for_audit(model: torch.nn.Module) -> None:
+    """Fingerprint the persistent shards, not validation's BF16 compute views."""
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
 
 
 def _auxiliary_parameters(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -74,6 +82,7 @@ class GenerationLoraAudit(Callback):
             stream.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
 
     def on_train_start(self, model: torch.nn.Module, iteration: int = 0) -> None:
+        _reshard_for_audit(model)
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.evidence_dir / f"rank-{rank}.jsonl"
@@ -211,6 +220,7 @@ class GenerationLoraAudit(Callback):
         )
 
     def on_train_end(self, model: torch.nn.Module, iteration: int = 0) -> None:
+        _reshard_for_audit(model)
         frozen = {}
         adapters = {}
         for name, parameter in model.named_parameters():

@@ -31,6 +31,13 @@ _CUSTOM_PAYLOAD = {
 # 1. pydantic schema validation                                               #
 # --------------------------------------------------------------------------- #
 class TestSchemaValidation:
+    def test_unlimited_training_has_explicit_sentinel(self) -> None:
+        raw = {"job": {"task": "vfm", "experiment": "mixed_control_epoch_nano"}, "trainer": {"max_iter": -1}}
+        assert SFTExperimentConfig.model_validate(raw).trainer.max_iter == -1
+        raw["trainer"]["max_iter"] = -2
+        with pytest.raises(ValidationError):
+            SFTExperimentConfig.model_validate(raw)
+
     def test_custom_section_validates_arbitrary_nested_content(self) -> None:
         """Arbitrary nested [custom] content passes through untouched."""
         raw = {

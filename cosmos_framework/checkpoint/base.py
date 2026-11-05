@@ -8,11 +8,11 @@ from typing import Optional
 
 import torch
 
-from cosmos_framework.utils.config import CheckpointConfig, JobConfig, ObjectStoreConfig
-from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback
+from cosmos_framework.utils.config import CheckpointConfig, JobConfig, ObjectStoreConfig
 from cosmos_framework.utils.easy_io import easy_io
+from cosmos_framework.utils.flags import INTERNAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +67,11 @@ class AbstractCheckpointer(ABC):
 
         # Set checkpoint directories for local and object store paths
         self._local_dirname = os.path.join(config_job.path_local, "checkpoints")
+        local_dirname = getattr(config_checkpoint, "local_dirname", None)
+        if local_dirname is not None:
+            if not os.path.isabs(local_dirname) or self.save_to_object_store:
+                raise ValueError("checkpoint.local_dirname requires an absolute filesystem destination")
+            self._local_dirname = local_dirname
         self._object_store_dirname = os.path.join(config_job.path, "checkpoints")
 
         self.strict_resume = config_checkpoint.strict_resume

@@ -269,6 +269,8 @@ class JITConfig:
 class CheckpointConfig:
     # possible checkpoint class
     type: Optional[Dict] = None
+    # Filesystem checkpoint storage may differ from RAM logs/runtime paths.
+    local_dirname: Optional[str] = None
 
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
@@ -465,7 +467,7 @@ class TrainerConfig:
     seed: int = 0
     # Gradient scaler arguments (for torch.amp.GradScaler).
     grad_scaler_args: dict = attrs.field(factory=lambda: dict(enabled=False))
-    # Maximum number of iterations to train the model.
+    # Maximum number of optimizer updates; -1 runs until externally stopped.
     max_iter: int = 999999999
     # Maximum number of iterations to validate the model. If None, validate on the entire dataset.
     max_val_iter: int | None = None
@@ -479,6 +481,8 @@ class TrainerConfig:
     prefetch_validation: bool = False
     # Whether to run the validation on the start of the training.
     run_validation_on_start: bool = False
+    # Explicitly evaluate restored weights before the first continued update.
+    run_validation_on_resume: bool = False
     # Kill the process after N seconds since the last iteration (usually means dead job).
     timeout_period: int = 999999999
     # Tensor memory organization format.

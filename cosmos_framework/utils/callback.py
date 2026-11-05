@@ -352,7 +352,8 @@ class ProgressBarCallback(Callback):
 
     @distributed.rank0_only
     def on_train_start(self, model: ImaginaireModel, iteration: int = 0) -> None:
-        self.train_pbar = tqdm.trange(self.config.trainer.max_iter, initial=iteration, desc="Training")
+        limit = self.config.trainer.max_iter
+        self.train_pbar = tqdm.tqdm(total=None if limit < 0 else limit, initial=iteration, desc="Training")
 
     @distributed.rank0_only
     def on_training_step_end(

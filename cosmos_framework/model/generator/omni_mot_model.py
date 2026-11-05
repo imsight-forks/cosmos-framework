@@ -4981,7 +4981,8 @@ class OmniMoTModel(ImaginaireModel):
 
     @torch.no_grad()
     def validation_step(self, data_batch: dict[str, torch.Tensor], iteration: int):
-        pass
+        """Evaluate the native flow objective without gradients or optimizer updates."""
+        return self.training_step(data_batch, iteration)
 
     @torch.no_grad()
     def forward(self, xt, t):

@@ -59,6 +59,28 @@ def test_resume_continues_without_dup_or_skip():
     assert resumed == [5, 6, 7]
 
 
+def test_eight_rank_epoch_shuffle_and_resume(monkeypatch):
+    """Every epoch covers the corpus once, and restart enters the next shuffle."""
+    size, world = 2400, 8
+    streams = [MapDistributor(_IdDS(size), seed=42).stream(rank, world, 0, 1) for rank in range(world)]
+    epochs = []
+    for epoch in range(2):
+        observed = []
+        for _ in range(size // world):
+            for stream in streams:
+                item = next(stream)
+                assert item["_dp_epoch"] == epoch
+                observed.append(item["id"].item())
+        assert sorted(observed) == list(range(size))
+        epochs.append(observed)
+    assert epochs[0] != epochs[1]
+    for rank in range(world):
+        monkeypatch.setenv("COSMOS_DL_STATE_WORKER_0_EPOCH", "0")
+        monkeypatch.setenv("COSMOS_DL_STATE_WORKER_0_INDEX", "299")
+        restarted = MapDistributor(_IdDS(size), seed=42).stream(rank, world, 0, 1)
+        assert next(restarted)["id"].item() == epochs[1][rank]
+
+
 def test_restart_iterator_preserves_trainer_rng_and_next_sample(monkeypatch):
     """Cursor restoration must preserve the next diffusion-noise draw too."""
     torch.manual_seed(132)

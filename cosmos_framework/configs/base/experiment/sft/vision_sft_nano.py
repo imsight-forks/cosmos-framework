@@ -468,6 +468,32 @@ mixed_control_progress_smoke_nano.trainer.callbacks.generation_lora_snapshots = 
     output_dir="${oc.env:LORA_SNAPSHOT_DIR}", binding_path="${oc.env:LORA_SNAPSHOT_BINDING}"
 )
 
+from cosmos_framework.callbacks.validated_wall_clock_checkpoint import ValidatedWallClockCheckpoint
+
+mixed_control_epoch_nano = copy.deepcopy(mixed_control_sft_nano)
+mixed_control_epoch_nano.job.name = "mixed_control_epoch_nano"
+mixed_control_epoch_nano.trainer.max_iter = 300
+mixed_control_epoch_nano.checkpoint.save_iter = 300
+mixed_control_epoch_nano.dataloader_train.distributor.dataset.source_view_control_staging_dir = "${oc.env:CONTROL_STAGING_DIR}"
+mixed_control_epoch_nano.dataloader_val = copy.deepcopy(mixed_control_epoch_nano.dataloader_train)
+mixed_control_epoch_nano.dataloader_val.distributor.shuffle = False
+mixed_control_epoch_nano.dataloader_val.distributor.name = "val"
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.jsonl_paths = ["${oc.env:VALIDATION_PANEL_PATH}"]
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.control_type = "depth-seg"
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.conditioning_mixture = None
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.source_view_execution_fingerprint = None
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.cfg_dropout_rate = 0.0
+mixed_control_epoch_nano.dataloader_val.distributor.dataset.source_view_dataset_fingerprint = "${oc.env:VALIDATION_DATASET_FINGERPRINT}"
+mixed_control_epoch_nano.trainer.run_validation = True
+mixed_control_epoch_nano.trainer.run_validation_on_start = True
+mixed_control_epoch_nano.trainer.max_val_iter = 4
+mixed_control_epoch_nano.trainer.prefetch_validation = False
+mixed_control_epoch_nano.trainer.validation_iter = 300
+mixed_control_epoch_nano.trainer.callbacks.validated_checkpoints = L(ValidatedWallClockCheckpoint)(
+    checkpoint_dir="${oc.env:NFS_CHECKPOINT_DIR}", evidence_dir="${oc.env:CHECKPOINT_EVIDENCE_DIR}",
+    validation_samples=32, interval_minutes=30, keep_last=5,
+)
+
 for _item in [
     vision_sft_nano,
     vision_sft_nano_mapstyle_dataloader,
@@ -475,6 +501,7 @@ for _item in [
     mixed_control_sft_nano,
     mixed_control_smoke_nano,
     mixed_control_progress_smoke_nano,
+    mixed_control_epoch_nano,
 ]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

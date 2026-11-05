@@ -594,7 +594,8 @@ class TrainerConfig(BaseModel):
     )
     max_iter: int = Field(
         default=500,
-        description="Total number of optimizer steps the run will execute.",
+        ge=-1,
+        description="Total optimizer steps; -1 disables the update limit.",
     )
     callbacks: TrainerCallbacksConfig = Field(default_factory=TrainerCallbacksConfig)
 
@@ -604,6 +605,7 @@ class CheckpointConfig(BaseModel):
     """Resume + save policy. Lands at ``config.checkpoint.*``."""
 
     model_config = _PYDANTIC_MODEL_CONFIG
+    local_dirname: Optional[str] = Field(default=None, description="Explicit filesystem checkpoint root; independent of job logs.")
 
     dcp_per_thread_copy_ahead: Optional[int] = Field(
         default=None,

@@ -120,6 +120,9 @@ class LambdaWarmUpCosineScheduler:
             if n <= cl:
                 return interval
             interval += 1
+        # Continue at the final cycle's floor after its declared duration.
+        # This also preserves constant schedules when resuming past that point.
+        return len(self.cycle_lengths) - 1
 
     def schedule(self, n, **kwargs):
         cycle = self.find_in_interval(n)
@@ -159,7 +162,7 @@ class LambdaLinearScheduler(LambdaWarmUpCosineScheduler):
             self.last_f = f
             return f
         else:
-            f = self.f_min[cycle] + (self.f_max[cycle] - self.f_min[cycle]) * (self.cycle_lengths[cycle] - n) / (
+            f = self.f_min[cycle] + (self.f_max[cycle] - self.f_min[cycle]) * max(0, self.cycle_lengths[cycle] - n) / (
                 self.cycle_lengths[cycle] - self.lr_warm_up_steps[cycle]
             )
             self.last_f = f

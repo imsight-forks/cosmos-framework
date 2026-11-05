@@ -119,6 +119,7 @@ class TransferSFTDataset(SFTDataset):
         control_type: str = "edge",
         conditioning_mixture: dict | None = None,
         source_view_execution_fingerprint: str | None = None,
+        source_view_control_staging_dir: str | None = None,
         **kwargs,
     ):
         assert control_type in _ON_THE_FLY_CONTROLS | _PRECOMPUTED_CONTROLS | {"depth-seg", "mixed"}, (
@@ -128,6 +129,7 @@ class TransferSFTDataset(SFTDataset):
         self.control_type = control_type
         self.conditioning_mixture = conditioning_mixture
         self.source_view_execution_fingerprint = source_view_execution_fingerprint
+        self.source_view_control_staging_dir = source_view_control_staging_dir
 
     def _load_precomputed_control(
         self,
@@ -332,7 +334,8 @@ class TransferSFTDataset(SFTDataset):
             mode = self.control_type
             if mode not in MODE_CONTROLS or MODE_CONTROLS[mode] != record.control_kinds:
                 raise ValueError(f"sample {record.sample_id}: configured control set differs from frozen parent")
-        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode]) as pair:
+        staging = None if self.source_view_control_staging_dir is None else Path(self.source_view_control_staging_dir)
+        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode], control_staging_dir=staging) as pair:
             video = torch.from_numpy(np.ascontiguousarray(pair.target.transpose(3, 0, 1, 2)))
             sample = self._build_sample(
                 metadata,
@@ -380,8 +383,8 @@ def _source_view_metadata(record: dict) -> dict:
         raise RuntimeError("Source-view rows require the installed compatible datagen-aigc-render package") from exc
     if record["source_view"].get("schema_version", 1) == 2:
         from datagen_aigc_render.video_samples.training_multi import (
-            SourceViewTrainingRecordV2,
             SourceViewTrainingBindingsV2,
+            SourceViewTrainingRecordV2,
         )
 
         frozen = SourceViewTrainingRecordV2.model_validate(record["source_view"])
@@ -507,6 +510,7 @@ def get_transfer_sft_dataset(
     source_view_loader_revision: str | None = None,
     conditioning_mixture: dict | None = None,
     source_view_execution_fingerprint: str | None = None,
+    source_view_control_staging_dir: str | None = None,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -630,6 +634,7 @@ def get_transfer_sft_dataset(
         control_type=control_type,
         conditioning_mixture=conditioning_mixture,
         source_view_execution_fingerprint=source_view_execution_fingerprint,
+        source_view_control_staging_dir=source_view_control_staging_dir,
         temporal_interval_mode=temporal_interval_mode,
         frame_selection_mode=frame_selection_mode,
         tokenizer_config=tokenizer_config,
