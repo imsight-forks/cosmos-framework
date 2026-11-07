@@ -120,16 +120,37 @@ class TransferSFTDataset(SFTDataset):
         conditioning_mixture: dict | None = None,
         source_view_execution_fingerprint: str | None = None,
         source_view_control_staging_dir: str | None = None,
+        source_view_compressed_labels_manifest: str | None = None,
+        source_view_compressed_labels_root: str | None = None,
         **kwargs,
     ):
         assert control_type in _ON_THE_FLY_CONTROLS | _PRECOMPUTED_CONTROLS | {"depth-seg", "mixed"}, (
             f"Unknown control_type={control_type!r}"
         )
+        for value in (source_view_compressed_labels_manifest, source_view_compressed_labels_root):
+            if value is not None and not value.strip():
+                raise ValueError("Compressed label paths cannot be empty")
+        if source_view_compressed_labels_root is not None and source_view_compressed_labels_manifest is None:
+            raise ValueError("Compressed labels root requires a manifest")
         super().__init__(*args, **kwargs)
         self.control_type = control_type
         self.conditioning_mixture = conditioning_mixture
         self.source_view_execution_fingerprint = source_view_execution_fingerprint
         self.source_view_control_staging_dir = source_view_control_staging_dir
+        self.compressed_store = None
+        if source_view_compressed_labels_manifest is not None:
+            from datagen_aigc_render.video_samples.compressed_controls import CompressedControlStore
+            from datagen_aigc_render.video_samples.training_multi import SourceViewTrainingRecordV2
+
+            if any(row.get("source_view", {}).get("schema_version") != 2 for row in self.metadata):
+                raise ValueError("Compressed labels require version-two source-view rows")
+            self.compressed_store = CompressedControlStore.load(
+                Path(source_view_compressed_labels_manifest),
+                None if source_view_compressed_labels_root is None else Path(source_view_compressed_labels_root),
+            )
+            self.compressed_store.verify_records(
+                [SourceViewTrainingRecordV2.model_validate(row["source_view"]) for row in self.metadata]
+            )
 
     def _load_precomputed_control(
         self,
@@ -335,7 +356,7 @@ class TransferSFTDataset(SFTDataset):
             if mode not in MODE_CONTROLS or MODE_CONTROLS[mode] != record.control_kinds:
                 raise ValueError(f"sample {record.sample_id}: configured control set differs from frozen parent")
         staging = None if self.source_view_control_staging_dir is None else Path(self.source_view_control_staging_dir)
-        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode], control_staging_dir=staging) as pair:
+        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode], control_staging_dir=staging, compressed_store=self.compressed_store) as pair:
             video = torch.from_numpy(np.ascontiguousarray(pair.target.transpose(3, 0, 1, 2)))
             sample = self._build_sample(
                 metadata,
@@ -370,6 +391,11 @@ class TransferSFTDataset(SFTDataset):
             sample["source_view_fingerprint"] = record.semantic_fingerprint
             sample["source_realization_fingerprint"] = record.realization.semantic_fingerprint
             sample["source_effective_rate"] = f"{pair.effective_rate.numerator}/{pair.effective_rate.denominator}"
+            if self.compressed_store is not None:
+                # Storage provenance is deliberately outside canonical/sample and cursor identities.
+                sample["control_storage_fingerprint"] = self.compressed_store.manifest.fingerprint
+                sample["control_storage_decoder"] = self.compressed_store.manifest.decoder_revision
+                sample["control_storage_root"] = str(self.compressed_store.root)
             return sample
 
 
@@ -511,6 +537,8 @@ def get_transfer_sft_dataset(
     conditioning_mixture: dict | None = None,
     source_view_execution_fingerprint: str | None = None,
     source_view_control_staging_dir: str | None = None,
+    source_view_compressed_labels_manifest: str | None = None,
+    source_view_compressed_labels_root: str | None = None,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -635,6 +663,8 @@ def get_transfer_sft_dataset(
         conditioning_mixture=conditioning_mixture,
         source_view_execution_fingerprint=source_view_execution_fingerprint,
         source_view_control_staging_dir=source_view_control_staging_dir,
+        source_view_compressed_labels_manifest=source_view_compressed_labels_manifest,
+        source_view_compressed_labels_root=source_view_compressed_labels_root,
         temporal_interval_mode=temporal_interval_mode,
         frame_selection_mode=frame_selection_mode,
         tokenizer_config=tokenizer_config,

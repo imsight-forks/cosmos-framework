@@ -46,6 +46,18 @@ PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
     # ``model.config.<X>`` in the Hydra tree. ``attn_implementation`` is a
     # VLM-only knob — skip it on VFM. Other sections pass through.
     "vfm": {
+        ("dataloader_train", "source_view_compressed_labels_manifest"): (
+            "dataloader_train", "distributor", "dataset", "source_view_compressed_labels_manifest",
+        ),
+        ("dataloader_train", "source_view_compressed_labels_root"): (
+            "dataloader_train", "distributor", "dataset", "source_view_compressed_labels_root",
+        ),
+        ("dataloader_val", "source_view_compressed_labels_manifest"): (
+            "dataloader_val", "distributor", "dataset", "source_view_compressed_labels_manifest",
+        ),
+        ("dataloader_val", "source_view_compressed_labels_root"): (
+            "dataloader_val", "distributor", "dataset", "source_view_compressed_labels_root",
+        ),
         # [job].upload_reproducible_setup lives at the top-level config field,
         # not config.job.* — hoist it out of the job section.
         ("job", "upload_reproducible_setup"): ("upload_reproducible_setup",),

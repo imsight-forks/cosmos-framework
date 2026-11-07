@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import tomllib
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cosmos_framework.configs.toml_config.toml_config_helper import (
     TASK_TO_BASE_CONFIG,
@@ -651,6 +651,9 @@ class DataloaderTrainConfig(BaseModel):
 
     model_config = _PYDANTIC_MODEL_CONFIG
 
+    source_view_compressed_labels_manifest: str | None = Field(default=None)
+    source_view_compressed_labels_root: str | None = Field(default=None)
+
     max_samples_per_batch: Optional[int] = Field(
         default=None,
         description=(
@@ -701,6 +704,7 @@ class SFTExperimentConfig(BaseModel):
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     dataloader_train: DataloaderTrainConfig = Field(default_factory=DataloaderTrainConfig)
+    dataloader_val: DataloaderTrainConfig | None = None
     custom: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -710,6 +714,21 @@ class SFTExperimentConfig(BaseModel):
             "resolution; specify concrete values here (no ${...} interpolation)."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_compressed_labels(self):
+        for loader in (self.dataloader_train, self.dataloader_val):
+            if loader is None:
+                continue
+            manifest = loader.source_view_compressed_labels_manifest
+            root = loader.source_view_compressed_labels_root
+            if any(value is not None and not value.strip() for value in (manifest, root)):
+                raise ValueError("Compressed label paths cannot be empty")
+            if root is not None and manifest is None:
+                raise ValueError("Compressed labels root requires a manifest")
+            if manifest is not None and self.job.task != "vfm":
+                raise ValueError("Compressed labels require the VFM source-view loader")
+        return self
 
 
 # ---------------------------------------------------------------------------
