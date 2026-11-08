@@ -122,6 +122,7 @@ class TransferSFTDataset(SFTDataset):
         source_view_control_staging_dir: str | None = None,
         source_view_compressed_labels_manifest: str | None = None,
         source_view_compressed_labels_root: str | None = None,
+        source_view_cpu: dict | None = None,
         **kwargs,
     ):
         assert control_type in _ON_THE_FLY_CONTROLS | _PRECOMPUTED_CONTROLS | {"depth-seg", "mixed"}, (
@@ -137,20 +138,24 @@ class TransferSFTDataset(SFTDataset):
         self.conditioning_mixture = conditioning_mixture
         self.source_view_execution_fingerprint = source_view_execution_fingerprint
         self.source_view_control_staging_dir = source_view_control_staging_dir
+        self.source_view_cpu = source_view_cpu
         self.compressed_store = None
         if source_view_compressed_labels_manifest is not None:
             from datagen_aigc_render.video_samples.compressed_controls import CompressedControlStore
             from datagen_aigc_render.video_samples.training_multi import parse_source_view_training_record
 
-            if any(row.get("source_view", {}).get("schema_version") not in (2, 3) for row in self.metadata):
+            from datagen_aigc_render.cosmos3_training.native_inputs import NativeIndexedRows
+            indexed = isinstance(self.metadata, NativeIndexedRows)
+            if not indexed and any(row.get("source_view", {}).get("schema_version") not in (2, 3) for row in self.metadata):
                 raise ValueError("Compressed labels require version-two source-view rows")
             self.compressed_store = CompressedControlStore.load(
                 Path(source_view_compressed_labels_manifest),
                 None if source_view_compressed_labels_root is None else Path(source_view_compressed_labels_root),
             )
-            self.compressed_store.verify_records(
-                [parse_source_view_training_record(row["source_view"]) for row in self.metadata]
-            )
+            if not indexed:
+                self.compressed_store.verify_records(
+                    [parse_source_view_training_record(row["source_view"]) for row in self.metadata]
+                )
 
     def _load_precomputed_control(
         self,
@@ -336,8 +341,8 @@ class TransferSFTDataset(SFTDataset):
             open_source_view_multi,
         )
 
-        record = parse_source_view_training_record(metadata["source_view"])
-        bindings = SourceViewTrainingBindingsV2.model_validate(metadata["source_bindings"])
+        record = metadata.get("_dsgen_record") or parse_source_view_training_record(metadata["source_view"])
+        bindings = metadata.get("_dsgen_bindings") or SourceViewTrainingBindingsV2.model_validate(metadata["source_bindings"])
         if self.num_video_frames not in (-1, record.declaration.frame_count):
             raise ValueError(f"sample {record.sample_id}: configured frame count differs")
         if (record.declaration.frame_count - 1) % self.temporal_compression_factor:
@@ -356,7 +361,13 @@ class TransferSFTDataset(SFTDataset):
             if mode not in MODE_CONTROLS or MODE_CONTROLS[mode] != record.control_kinds:
                 raise ValueError(f"sample {record.sample_id}: configured control set differs from frozen parent")
         staging = None if self.source_view_control_staging_dir is None else Path(self.source_view_control_staging_dir)
-        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode], control_staging_dir=staging, compressed_store=self.compressed_store) as pair:
+        provider = None
+        if self.source_view_cpu is not None:
+            from datagen_aigc_render.video_samples.provider import FrameProvider, ProviderLimits
+            provider = FrameProvider(ProviderLimits(max_decoded_bytes=self.source_view_cpu["decoded_bytes"]),
+                decoder_threads=self.source_view_cpu["decoder_threads"],
+                decode_timeout_seconds=self.source_view_cpu["timeout_seconds"])
+        with open_source_view_multi(record, bindings, selected_controls=MODE_CONTROLS[mode], provider=provider, control_staging_dir=staging, compressed_store=self.compressed_store) as pair:
             video = torch.from_numpy(np.ascontiguousarray(pair.target.transpose(3, 0, 1, 2)))
             sample = self._build_sample(
                 metadata,
@@ -414,7 +425,7 @@ def _source_view_metadata(record: dict) -> dict:
         )
 
         frozen = parse_source_view_training_record(record["source_view"])
-        SourceViewTrainingBindingsV2.model_validate(record["source_bindings"])
+        parsed_bindings = SourceViewTrainingBindingsV2.model_validate(record["source_bindings"])
     else:
         frozen = SourceViewTrainingRecord.model_validate(record["source_view"])
         SourceViewTrainingBindings.model_validate(record["source_bindings"])
@@ -424,7 +435,7 @@ def _source_view_metadata(record: dict) -> dict:
     caption_key = (
         "caption_json" if isinstance(frozen.caption, dict) or frozen.caption_format == "structured-json" else "caption"
     )
-    return {
+    result = {
         "uuid": frozen.sample_id,
         "vision_path": f"source-view:{frozen.sample_id}",
         "width": declaration.output_width,
@@ -436,6 +447,9 @@ def _source_view_metadata(record: dict) -> dict:
         "source_view": frozen.model_dump(mode="json"),
         "source_bindings": record["source_bindings"],
     }
+    if record["source_view"].get("schema_version", 1) in (2, 3):
+        result.update(_dsgen_record=frozen, _dsgen_bindings=parsed_bindings)
+    return result
 
 
 def _load_transfer_metadata(
@@ -539,6 +553,8 @@ def get_transfer_sft_dataset(
     source_view_control_staging_dir: str | None = None,
     source_view_compressed_labels_manifest: str | None = None,
     source_view_compressed_labels_root: str | None = None,
+    source_view_prepared_index: dict | None = None,
+    source_view_cpu: dict | None = None,
     **kwargs,
 ) -> TransferSFTDataset:
     """Create a TransferSFTDataset from one or more JSONL files.
@@ -582,77 +598,90 @@ def get_transfer_sft_dataset(
         else None
     )
 
-    metadata_list: list[dict] = []
-    for idx, jsonl_url in enumerate(jsonl_paths):
-        prefix = f"{idx}/" if len(jsonl_paths) > 1 else ""
-        metadata_list.extend(
-            _load_transfer_metadata(
-                s3_client,
-                jsonl_url,
-                min_frames=num_video_frames if num_video_frames > 0 else 1,
-                uuid_prefix=prefix,
-                min_short_edge=min_short_edge,
-                control_type=control_type,
+    if source_view_prepared_index is not None:
+        from datagen_aigc_render.cosmos3_training.native_inputs import NativeIndexedRows
+        from datagen_aigc_render.video_samples.training_multi import ConditioningMixturePolicy, source_view_training_execution_identity
+        if source_view_cpu is None:
+            raise ValueError("Prepared inputs require the admitted CPU resource plan")
+        metadata_list = NativeIndexedRows(source_view_prepared_index, max_bytes=source_view_cpu["metadata_bytes"])
+        if (metadata_list.header["dataset_fingerprint"] != source_view_dataset_fingerprint
+                or metadata_list.header["loader_revision"] != source_view_loader_revision):
+            raise ValueError("Prepared input dataset/loader identity differs")
+        if control_type == "mixed" and source_view_training_execution_identity(
+                source_view_dataset_fingerprint, ConditioningMixturePolicy.model_validate(conditioning_mixture or {})) != source_view_execution_fingerprint:
+            raise ValueError("Prepared mixed input execution identity differs")
+    else:
+        metadata_list: list[dict] = []
+        for idx, jsonl_url in enumerate(jsonl_paths):
+            prefix = f"{idx}/" if len(jsonl_paths) > 1 else ""
+            metadata_list.extend(
+                _load_transfer_metadata(
+                    s3_client,
+                    jsonl_url,
+                    min_frames=num_video_frames if num_video_frames > 0 else 1,
+                    uuid_prefix=prefix,
+                    min_short_edge=min_short_edge,
+                    control_type=control_type,
+                )
             )
+
+        source_rows = [record for record in metadata_list if "source_view" in record]
+        if source_rows:
+            from datagen_aigc_render.video_samples.training import (
+                SOURCE_VIEW_LOADER_REVISION,
+                SourceViewTrainingRecord,
+                source_view_dataset_identity,
+            )
+
+            if len(source_rows) != len(metadata_list):
+                raise ValueError("Encoded and source-view representations require separate dataset identities")
+            versions = {record["source_view"].get("schema_version", 1) for record in source_rows}
+            if len(versions) != 1:
+                raise ValueError("Source-view schema versions require separate dataset identities")
+            revision = SOURCE_VIEW_LOADER_REVISION
+            if versions in ({2}, {3}):
+                from datagen_aigc_render.video_samples.training_multi import (
+                    SOURCE_VIEW_MULTI_LOADER_REVISION,
+                    ConditioningMixturePolicy,
+                    parse_source_view_training_record,
+                    source_view_multi_dataset_identity,
+                    source_view_training_execution_identity,
+                )
+
+                identity = source_view_multi_dataset_identity(
+                    tuple(parse_source_view_training_record(record["source_view"]) for record in source_rows)
+                )
+                revision = "dsgen-source-view-multi-v3" if versions == {3} else SOURCE_VIEW_MULTI_LOADER_REVISION
+                if control_type == "mixed":
+                    policy = ConditioningMixturePolicy.model_validate(conditioning_mixture or {})
+                    expected_execution = source_view_training_execution_identity(identity, policy)
+                    if source_view_execution_fingerprint != expected_execution:
+                        raise ValueError("Source-view mixed training execution/policy identity differs or is missing")
+            else:
+                identity = source_view_dataset_identity(
+                    tuple(SourceViewTrainingRecord.model_validate(record["source_view"]) for record in source_rows)
+                )
+                if control_type in {"mixed", "depth-seg"}:
+                    raise ValueError("Mixed/joint training requires version-two source-view rows")
+            if source_view_dataset_fingerprint != identity or source_view_loader_revision != revision:
+                raise ValueError(
+                    "Source-view dataset/loader identity differs or is missing; incompatible resume is forbidden"
+                )
+
+        if not source_rows and control_type in {"mixed", "depth-seg"}:
+            raise ValueError("Mixed/joint control training requires canonical version-two source views")
+        if sample_by_window and not source_rows:
+            metadata_list = [
+                {**record, "uuid": f"{record['uuid']}_w{index}", "t2w_windows": [window]}
+                for record in metadata_list
+                for index, window in enumerate(record["t2w_windows"])
+            ]
+        metadata_list.sort(key=lambda record: hashlib.sha256(record["uuid"].encode()).hexdigest())
+        total_windows = sum(len(m["t2w_windows"]) for m in metadata_list)
+        log.info(
+            f"Transfer SFT: {len(metadata_list)} videos, {total_windows} windows, "
+            f"control_type={control_type}, resolution={resolution}"
         )
-
-    source_rows = [record for record in metadata_list if "source_view" in record]
-    if source_rows:
-        from datagen_aigc_render.video_samples.training import (
-            SOURCE_VIEW_LOADER_REVISION,
-            SourceViewTrainingRecord,
-            source_view_dataset_identity,
-        )
-
-        if len(source_rows) != len(metadata_list):
-            raise ValueError("Encoded and source-view representations require separate dataset identities")
-        versions = {record["source_view"].get("schema_version", 1) for record in source_rows}
-        if len(versions) != 1:
-            raise ValueError("Source-view schema versions require separate dataset identities")
-        revision = SOURCE_VIEW_LOADER_REVISION
-        if versions in ({2}, {3}):
-            from datagen_aigc_render.video_samples.training_multi import (
-                SOURCE_VIEW_MULTI_LOADER_REVISION,
-                ConditioningMixturePolicy,
-                parse_source_view_training_record,
-                source_view_multi_dataset_identity,
-                source_view_training_execution_identity,
-            )
-
-            identity = source_view_multi_dataset_identity(
-                tuple(parse_source_view_training_record(record["source_view"]) for record in source_rows)
-            )
-            revision = "dsgen-source-view-multi-v3" if versions == {3} else SOURCE_VIEW_MULTI_LOADER_REVISION
-            if control_type == "mixed":
-                policy = ConditioningMixturePolicy.model_validate(conditioning_mixture or {})
-                expected_execution = source_view_training_execution_identity(identity, policy)
-                if source_view_execution_fingerprint != expected_execution:
-                    raise ValueError("Source-view mixed training execution/policy identity differs or is missing")
-        else:
-            identity = source_view_dataset_identity(
-                tuple(SourceViewTrainingRecord.model_validate(record["source_view"]) for record in source_rows)
-            )
-            if control_type in {"mixed", "depth-seg"}:
-                raise ValueError("Mixed/joint training requires version-two source-view rows")
-        if source_view_dataset_fingerprint != identity or source_view_loader_revision != revision:
-            raise ValueError(
-                "Source-view dataset/loader identity differs or is missing; incompatible resume is forbidden"
-            )
-
-    if not source_rows and control_type in {"mixed", "depth-seg"}:
-        raise ValueError("Mixed/joint control training requires canonical version-two source views")
-    if sample_by_window and not source_rows:
-        metadata_list = [
-            {**record, "uuid": f"{record['uuid']}_w{index}", "t2w_windows": [window]}
-            for record in metadata_list
-            for index, window in enumerate(record["t2w_windows"])
-        ]
-    metadata_list.sort(key=lambda record: hashlib.sha256(record["uuid"].encode()).hexdigest())
-    total_windows = sum(len(m["t2w_windows"]) for m in metadata_list)
-    log.info(
-        f"Transfer SFT: {len(metadata_list)} videos, {total_windows} windows, "
-        f"control_type={control_type}, resolution={resolution}"
-    )
 
     return TransferSFTDataset(
         metadata=metadata_list,
@@ -665,6 +694,7 @@ def get_transfer_sft_dataset(
         source_view_control_staging_dir=source_view_control_staging_dir,
         source_view_compressed_labels_manifest=source_view_compressed_labels_manifest,
         source_view_compressed_labels_root=source_view_compressed_labels_root,
+        source_view_cpu=source_view_cpu,
         temporal_interval_mode=temporal_interval_mode,
         frame_selection_mode=frame_selection_mode,
         tokenizer_config=tokenizer_config,
@@ -696,9 +726,10 @@ class TransferSFTMapDataset(torch.utils.data.Dataset):
         if not source.metadata:
             raise ValueError("Paired SFT requires at least one eligible window")
         self.source = source
+        from datagen_aigc_render.cosmos3_training.native_inputs import NativeIndexedRows
         self.source.s3_client = (
             None
-            if all("source_view" in record for record in source.metadata)
+            if isinstance(source.metadata, NativeIndexedRows) or all("source_view" in record for record in source.metadata)
             else boto3.client("s3", **source.s3_credentials, config=client_config)
         )
 

@@ -528,6 +528,11 @@ class ImaginaireTrainer:
             log.info(f"Set SM carveout to {sm_carveout}")
         self.callbacks.on_train_start(model, iteration=iteration)
         # Initial validation.
+        for callback in self.callbacks._callbacks:
+            ready = getattr(callback, "on_training_ready", None)
+            if ready is not None:
+                ready(model, optimizer=optimizer, scheduler=scheduler, grad_scaler=grad_scaler,
+                      dataloader_val=dataloader_val, iteration=iteration)
         if self.config.trainer.run_validation and (
             (iteration == 0 and self.config.trainer.run_validation_on_start)
             or (iteration > 0 and self.config.trainer.run_validation_on_resume)
@@ -628,6 +633,10 @@ class ImaginaireTrainer:
                     # validation or the next training step. Callback-owned references remain valid.
                     del output_batch, loss
                     # Validation.
+                    for callback in self.callbacks._callbacks:
+                        boundary = getattr(callback, "on_optimizer_boundary", None)
+                        if boundary is not None:
+                            boundary(model, iteration=iteration)
                     if self.config.trainer.run_validation and (
                         iteration % self.config.trainer.validation_iter == 0
                         or self._validation_requested_at == iteration
@@ -649,7 +658,8 @@ class ImaginaireTrainer:
         log.success("Done with training.")
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
-        if (self.config.checkpoint.save_iter <= 0 or iteration % self.config.checkpoint.save_iter != 0) and self._stop_after_checkpoint_at != iteration and not (Path(self.checkpointer.save_dirname) / f"iter_{iteration:09d}" / "adapter-checkpoint.json").is_file():
+        managed_saves = any(getattr(callback, "manages_checkpoints", False) for callback in self.callbacks._callbacks)
+        if not managed_saves and (self.config.checkpoint.save_iter <= 0 or iteration % self.config.checkpoint.save_iter != 0) and self._stop_after_checkpoint_at != iteration and not (Path(self.checkpointer.save_dirname) / f"iter_{iteration:09d}" / "adapter-checkpoint.json").is_file():
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()

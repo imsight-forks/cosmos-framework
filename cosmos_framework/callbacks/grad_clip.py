@@ -256,11 +256,15 @@ class GradClip(Callback):
         force_finite: bool = True,
         error_if_nonfinite: bool = False,
         track_per_modality: bool = False,
+        expose_norm: bool = False,
     ):
         self.clip_norm = clip_norm
         self.force_finite = force_finite
         self.error_if_nonfinite = error_if_nonfinite
         self.track_per_modality = track_per_modality
+        self.expose_norm = expose_norm
+        self.last_global_norm = None
+        self.last_norm_iteration = None
 
         # Outer key: modality bucket name. For VLM we use a single bucket "" so
         # wandb keys are short (`clip_grad_norm/{mesh}`); for VFM the bucket is
@@ -400,6 +404,9 @@ class GradClip(Callback):
         for mesh_str, mesh_norm in per_mesh_norms.items():
             cur_state[mesh_str].update(mesh_norm)
         cur_state["global"].update(global_norm)
+        if self.expose_norm:
+            self.last_global_norm = global_norm.detach()
+            self.last_norm_iteration = iteration
 
         # 8. Log after the optimizer-step counter advances, in
         #    ``on_training_step_end``.
