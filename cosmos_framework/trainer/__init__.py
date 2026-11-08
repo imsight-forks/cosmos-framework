@@ -496,6 +496,8 @@ class ImaginaireTrainer:
             dataloader_val (torch.utils.data.DataLoader): The validation data loader.
         """
         # Leaving this for backward compability for now, but we can think about moving this to model.on_train_start for all models.
+        # Expose the actual loader to checkpoint callbacks; configurations are not loader instances.
+        self.dataloader_train = dataloader_train
         model = model.to("cuda", memory_format=self.config.trainer.memory_format)  # type: ignore
         model.on_train_start(self.config.trainer.memory_format)
 

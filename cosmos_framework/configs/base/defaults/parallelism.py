@@ -37,6 +37,9 @@ class ParallelismConfig:
     # set neither.
     data_parallel_replicate_degree: int = -1
 
+    # None preserves native defaults; explicit values govern block parameter residency.
+    reshard_after_forward: bool | None = None
+
     # Number of ranks for context parallelism.
     context_parallel_shard_degree: int = 1
 

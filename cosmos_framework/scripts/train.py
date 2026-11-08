@@ -285,6 +285,10 @@ if __name__ == "__main__":
     # only takes --sft-toml, so alias it so the launch info records the TOML.
     args.config = args.sft_toml
 
+    if os.environ.get("DSGEN_COSMOS3_PREFLIGHT_OUTPUT"):
+        from datagen_aigc_render.cosmos3_training.native_v2 import verify_native_configuration
+        verify_native_configuration(config)
+
     if args.dryrun:
         logging.info("Config:\n" + config.pretty_print(use_color=True))
         os.makedirs(config.job.path_local, exist_ok=True)

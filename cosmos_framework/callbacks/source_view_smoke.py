@@ -68,7 +68,7 @@ def _batch_identity(value):
 class SourceViewTrainingSmoke(GenerationLoraAudit):
     """Observes native training; comparison forwards perform no optimizer updates."""
 
-    def __init__(self, evidence_dir, max_updates=6):
+    def __init__(self, evidence_dir, max_updates=6, allow_resume=False):
         super().__init__(evidence_dir)
         if type(max_updates) is not int or not 1 <= max_updates <= 6:
             raise ValueError("Native training smoke permits at most six optimizer updates")
@@ -78,14 +78,18 @@ class SourceViewTrainingSmoke(GenerationLoraAudit):
         self.initial_loss = None
         self.modes = set()
         self.updates = 0
+        self.allow_resume = allow_resume
+        self.starting_iteration = 0
 
     def on_train_start(self, model, iteration=0):
         if (
-            iteration != 0
+            (iteration != 0 and not self.allow_resume)
+            or not 0 <= iteration < self.config.trainer.max_iter <= self.max_updates
             or self.config.trainer.max_iter > self.max_updates
             or self.config.trainer.grad_accum_iter != 1
         ):
             raise ValueError("Smoke requires a fresh capped run with one microbatch per update")
+        self.starting_iteration = iteration
         super().on_train_start(model, iteration)
 
     def on_training_step_start(self, model, data_batch, iteration=0):
@@ -112,7 +116,7 @@ class SourceViewTrainingSmoke(GenerationLoraAudit):
         )
 
     def on_before_optimizer_step(self, model, optimizer, scheduler, grad_scaler, iteration=0):
-        if self.updates >= self.max_updates:
+        if self.starting_iteration + self.updates >= self.max_updates:
             raise ValueError("Native smoke optimizer update cap exceeded")
         super().on_before_optimizer_step(model, optimizer, scheduler, grad_scaler, iteration)
         if not any(entry["norm"] is not None and entry["norm"] > 0 for entry in self.gradients.values()):

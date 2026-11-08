@@ -41,6 +41,7 @@ The sharded format enables efficient distributed saving/loading by:
 
 import dataclasses
 import enum
+import json
 import multiprocessing
 import os
 import queue
@@ -50,6 +51,7 @@ import time
 import traceback
 from datetime import timedelta
 from multiprocessing import get_context
+from pathlib import Path
 from typing import Any, Dict, Optional, Protocol, Tuple, Union, runtime_checkable
 
 import torch
@@ -57,6 +59,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch import nn
 from torch.distributed.checkpoint.default_planner import create_default_local_load_plan
+from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.filesystem import FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.metadata import (
     STATE_DICT_TYPE,
@@ -317,6 +320,58 @@ def _replace_keys_with_ema_keys(state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
     if not all(k.startswith("net.") for k in state_dict.keys()):
         raise ValueError("State dict must start with net. keys when load_ema_to_reg is True")
     return {k.replace("net.", "net_ema."): v for k, v in state_dict.items()}
+
+
+def verify_legacy_frozen_base(checkpoint: Path, base_checkpoint: Path, max_tensor_bytes: int = 4 * 1024**3, expected_world_size: int | None = None) -> dict:
+    """Compare legacy frozen state against its external base on CPU, one tensor at a time.
+
+    At most two parameter buffers plus the reader's current serialized shard
+    are resident. Oversized tensor declarations fail before allocation; this
+    migration never materializes a whole model or writes any model payload.
+    """
+    from cosmos_framework.utils import log
+    from datagen_aigc_render.cosmos3_training.checkpoints import is_adapter_key
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    if type(max_tensor_bytes) is not int or max_tensor_bytes <= 0:
+        raise ValueError("legacy tensor comparison requires a positive byte limit")
+    if expected_world_size is not None:
+        expected_ranks = {f"rank_{rank}.pkl" for rank in range(expected_world_size)}
+        actual_ranks = {path.name for path in (checkpoint / "dataloader").glob("rank_*.pkl")}
+        if actual_ranks != expected_ranks:
+            raise ValueError("legacy dataloader topology or per-rank state is incomplete")
+        trainer_metadata = FileSystemReader(checkpoint / "trainer").read_metadata()
+        rng_ranks = {name.split(".", 1)[0] for name in trainer_metadata.state_dict_metadata if name.startswith("rng_state_")}
+        if rng_ranks != {f"rng_state_{rank}" for rank in range(expected_world_size)}:
+            raise ValueError("legacy checkpoint per-rank RNG topology is incomplete")
+    base_reader = FileSystemReader(base_checkpoint / "model")
+    source_reader = FileSystemReader(checkpoint / "model")
+    base = base_reader.read_metadata().state_dict_metadata
+    source = source_reader.read_metadata().state_dict_metadata
+    adapters = {name for name in source if is_adapter_key(name)}
+    if not adapters or set(source) != set(base) | adapters or set(base) & adapters:
+        raise ValueError("legacy model does not partition into the bound frozen base and adapters")
+    largest = 0
+    for name in sorted(base):
+        expected, saved = base[name], source[name]
+        if not isinstance(expected, TensorStorageMetadata) or not isinstance(saved, TensorStorageMetadata):
+            raise ValueError(f"legacy frozen entry is not a tensor: {name}")
+        if expected.size != saved.size:
+            raise ValueError(f"legacy frozen tensor shape differs: {name}")
+        count = expected.size.numel()
+        byte_sizes = [count * torch.empty((), dtype=item.properties.dtype).element_size() for item in (expected, saved)]
+        if max(byte_sizes) > max_tensor_bytes:
+            raise ValueError(f"legacy frozen tensor exceeds comparison buffer limit: {name}")
+        largest = max(largest, *byte_sizes)
+        left = {name: torch.empty(expected.size, dtype=expected.properties.dtype, device="cpu")}
+        right = {name: torch.empty(saved.size, dtype=saved.properties.dtype, device="cpu")}
+        dcp.load(left, storage_reader=base_reader, planner=dcp.DefaultLoadPlanner(allow_partial_load=True), no_dist=True)
+        dcp.load(right, storage_reader=source_reader, planner=dcp.DefaultLoadPlanner(allow_partial_load=True), no_dist=True)
+        if not torch.equal(left[name], right[name]):
+            raise ValueError(f"legacy frozen tensor differs from the immutable base: {name}")
+        del left, right
+    log.info(f"Verified {len(base)} legacy frozen tensors against the external base")
+    return {"frozen_tensors_verified": len(base), "largest_tensor_bytes": largest, "max_tensor_bytes": max_tensor_bytes}
 
 
 class CustomLoadPlanner(dcp.DefaultLoadPlanner):
@@ -730,6 +785,22 @@ class DistributedCheckpointer(AbstractCheckpointer):
     ):
         super().__init__(config_checkpoint, config_job, callbacks)
         self.config_checkpoint = config_checkpoint
+        self.lora_only = getattr(config_checkpoint, "lora_only", False)
+        self._lora_base = None
+        self._lora_model_keys = None
+        if self.lora_only:
+            if (
+                config_checkpoint.dcp_async_mode_enabled
+                or self.save_to_object_store
+                or self.load_from_object_store
+                or config_checkpoint.load_ema_to_reg
+            ):
+                raise ValueError("Adapter-only recovery requires local synchronous DCP without EMA")
+            if not getattr(config_checkpoint, "base_checkpoint_path", None):
+                raise ValueError("Adapter-only recovery requires checkpoint.base_checkpoint_path")
+            self._lora_identity = json.loads(config_checkpoint.lora_identity or "null")
+            if not isinstance(self._lora_identity, dict) or not self._lora_identity:
+                raise ValueError("Adapter-only recovery requires a nonempty checkpoint.lora_identity object")
         if config_checkpoint.load_ema_to_reg and config_checkpoint.load_training_state:
             raise ValueError(
                 "load_ema_to_reg=True requires load_training_state=False. "
@@ -836,6 +907,52 @@ class DistributedCheckpointer(AbstractCheckpointer):
         resume_keys = self._filter_resume_keys(set(resume_keys), self.CHECKPOINT_KEYS, source)
         return resume_keys, source
 
+    def _lora_collective(self, operation):
+        """Do shared-filesystem verification once and deliver failures to every rank."""
+        value = [None, None]
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            try:
+                value[0] = operation()
+            except Exception as error:
+                value[1] = f"{type(error).__name__}: {error}"
+        if dist.is_initialized():
+            dist.broadcast_object_list(value, src=0)
+        if value[1] is not None:
+            raise ValueError(f"Adapter checkpoint verification failed: {value[1]}")
+        return value[0]
+
+    def _lora_base_binding(self):
+        from datagen_aigc_render.cosmos3_training.checkpoints import BaseCheckpointBinding, bind_base_checkpoint
+
+        if self._lora_base is None:
+            value = self._lora_collective(
+                lambda: bind_base_checkpoint(Path(self.config_checkpoint.base_checkpoint_path)).model_dump(mode="json")
+            )
+            self._lora_base = BaseCheckpointBinding.model_validate(value)
+        return self._lora_base
+
+    def _lora_state(self, model, optimizer):
+        from datagen_aigc_render.cosmos3_training.checkpoints import is_adapter_key
+
+        if any(parameter.requires_grad and not is_adapter_key(name) for name, parameter in model.named_parameters()):
+            raise ValueError("Adapter-only recovery cannot discard other trainable model parameters")
+        trainable = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+        optimizers = getattr(optimizer, "optimizers", (optimizer,))
+        grouped = [parameter for child in optimizers for group in child.param_groups for parameter in group["params"]]
+        if len(grouped) != len(trainable) or {id(parameter) for parameter in grouped} != trainable:
+            raise ValueError("Adapter-only recovery requires optimizer groups containing exactly the trainable adapters")
+        state = ModelWrapper(model).state_dict()
+        adapters = {name: value for name, value in state.items() if is_adapter_key(name)}
+        frozen = set(state) - set(adapters)
+        if not adapters:
+            raise ValueError("Adapter-only recovery found no LoRA tensors")
+        base = self._lora_base_binding()
+        base_metadata = FileSystemReader(base.root).read_metadata()
+        if set(base_metadata.state_dict_metadata) != frozen:
+            raise ValueError("External base does not cover exactly the frozen model state")
+        self._lora_model_keys = (tuple(sorted(adapters)), tuple(sorted(frozen)))
+        return adapters
+
     @misc.timer("checkpoint loading")
     def load(
         self,
@@ -856,6 +973,36 @@ class DistributedCheckpointer(AbstractCheckpointer):
 
         if source is not None:
             self._check_checkpoint_exists(source)
+            adapter_manifest = None
+            if self.lora_only:
+                from datagen_aigc_render.cosmos3_training.checkpoints import (
+                    AdapterCheckpointManifest,
+                    MANIFEST_NAME,
+                    verify_adapter_checkpoint,
+                )
+
+                self._lora_base_binding()
+                if Path(source.path, MANIFEST_NAME).is_file():
+                    value = self._lora_collective(
+                        lambda: verify_adapter_checkpoint(
+                            Path(source.path),
+                            base_checkpoint=Path(self.config_checkpoint.base_checkpoint_path),
+                            expected_identity=self._lora_identity,
+                            expected_world_size=dist.get_world_size(),
+                        ).model_dump(mode="json")
+                    )
+                    adapter_manifest = AdapterCheckpointManifest.model_validate(value)
+                    if resume_keys != sorted(self.CHECKPOINT_KEYS) or self.config_checkpoint.keys_to_skip_loading:
+                        raise ValueError("Adapter recovery requires complete training state and no skipped keys")
+                elif Path(source.path).resolve() != Path(self.config_checkpoint.base_checkpoint_path).resolve():
+                    if resume_keys != sorted(self.CHECKPOINT_KEYS) or self.config_checkpoint.keys_to_skip_loading:
+                        raise ValueError("Legacy migration requires complete training state and no skipped keys")
+                    self._lora_collective(
+                        lambda: verify_legacy_frozen_base(
+                            Path(source.path), Path(self.config_checkpoint.base_checkpoint_path),
+                            expected_world_size=dist.get_world_size(),
+                        )
+                    )
 
             for key in resume_keys:
                 dist.barrier()
@@ -890,12 +1037,30 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     log.info("- Loading the model...")
                     _model_wrapper = ModelWrapper(model)
                     _state_dict = _model_wrapper.state_dict()
-                    dcp.load(
-                        _state_dict,
-                        storage_reader=storage_reader,
-                        planner=load_planner,
-                        no_dist=True,
-                    )
+                    if adapter_manifest is not None:
+                        frozen = {name: _state_dict[name] for name in adapter_manifest.frozen_keys}
+                        adapters = {name: _state_dict[name] for name in adapter_manifest.adapter_keys}
+                        if set(frozen) | set(adapters) != set(_state_dict):
+                            raise ValueError("Recovered base/adapter inventory differs from the model")
+                        metadata = storage_reader.read_metadata()
+                        if set(metadata.state_dict_metadata) != set(adapters):
+                            raise ValueError("Adapter checkpoint model contains non-adapter or missing tensors")
+                        dcp.load(
+                            frozen,
+                            storage_reader=FileSystemReader(self._lora_base.root),
+                            planner=dcp.DefaultLoadPlanner(),
+                            no_dist=True,
+                        )
+                        dcp.load(adapters, storage_reader=storage_reader, planner=load_planner, no_dist=True)
+                        _state_dict.update(frozen)
+                        _state_dict.update(adapters)
+                    else:
+                        dcp.load(
+                            _state_dict,
+                            storage_reader=storage_reader,
+                            planner=load_planner,
+                            no_dist=True,
+                        )
                     if self.config_checkpoint.dcp_load_dedup:
                         # Fill in the reads the planner dropped by broadcasting from each leaf's
                         # single reader. Must run before the EMA copy and load_state_dict below.
@@ -925,12 +1090,43 @@ class DistributedCheckpointer(AbstractCheckpointer):
                 elif key == "optim":
                     log.info("- Loading the optimizer...")
                     _state_dict = optimizer.state_dict()
+                    optimizer_planner = load_planner
+                    if isinstance(optimizer, torch.optim.Optimizer) and not _state_dict.get("state"):
+                        # Fresh plain optimizers have no moment tensors yet.
+                        # Reconstruct the stored optimizer state instead of
+                        # silently loading only param_groups. The native
+                        # OptimizersContainer already supplies materialized,
+                        # correctly sharded tensors and retains its old path.
+                        if any(isinstance(p, DTensor) for group in optimizer.param_groups for p in group["params"]):
+                            raise ValueError("Uninitialized DTensor optimizers require the native OptimizersContainer")
+                        _state_dict = {}
+                        optimizer_planner = _EmptyStateDictLoadPlanner()
                     dcp.load(
                         _state_dict,
                         storage_reader=storage_reader,
-                        planner=load_planner,
+                        planner=optimizer_planner,
                         no_dist=True,
                     )
+                    if isinstance(optimizer_planner, _EmptyStateDictLoadPlanner):
+                        # dcp.load() snapshots the caller's initial top-level
+                        # keys. For an initially empty dict, the populated
+                        # object is retained by the planner rather than copied
+                        # back into that empty caller mapping.
+                        _state_dict = optimizer_planner.original_state_dict
+                        # DCP flattens dictionary keys to strings. Optimizer
+                        # parameter IDs must retain the type stored in each
+                        # param_group so load_state_dict can associate moments
+                        # with the live parameters instead of keeping orphaned
+                        # string-keyed state.
+                        parameter_ids = {
+                            str(parameter_id): parameter_id
+                            for group in _state_dict["param_groups"]
+                            for parameter_id in group["params"]
+                        }
+                        _state_dict["state"] = {
+                            parameter_ids.get(str(parameter_id), parameter_id): state
+                            for parameter_id, state in _state_dict["state"].items()
+                        }
                     if self.config_checkpoint.dcp_load_dedup:
                         # Fill in the reads the planner dropped by broadcasting from each leaf's
                         # single reader. Must run before load_state_dict below.
@@ -1222,6 +1418,27 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     planner=save_planner,
                 )
 
+        if self.lora_only:
+            from datagen_aigc_render.cosmos3_training.checkpoints import publish_adapter_checkpoint
+
+            dist.barrier()
+            base = self._lora_base_binding()
+            adapters, frozen = self._lora_model_keys
+
+            def complete_adapter_checkpoint():
+                root = Path(self.save_dirname, checkpoint_file)
+                metadata = FileSystemReader(str(root / "model")).read_metadata()
+                if set(metadata.state_dict_metadata) != set(adapters):
+                    raise ValueError("Saved model contains non-adapter or missing tensors")
+                manifest = publish_adapter_checkpoint(
+                    root, base=base, adapter_keys=adapters, frozen_keys=frozen,
+                    iteration=int(checkpoint_file.removeprefix("iter_")),
+                    world_size=dist.get_world_size(), identity=self._lora_identity,
+                )
+                return manifest.model_dump(mode="json")
+
+            self._lora_collective(complete_adapter_checkpoint)
+
         if distributed.is_rank0():
             log.info(f"Saving last checkpoint file {checkpoint_file}")
             self._write_latest_checkpoint_file(checkpoint_file)
@@ -1252,12 +1469,18 @@ class DistributedCheckpointer(AbstractCheckpointer):
             self.callbacks.on_save_checkpoint_start(model, iteration)
 
         checkpoint_file = f"iter_{iteration:09}"
+        if self.lora_only:
+            def require_fresh_destination():
+                if Path(self.save_dirname, checkpoint_file).exists():
+                    raise ValueError("Adapter checkpoint requires a fresh iteration destination")
+
+            self._lora_collective(require_fresh_destination)
 
         # Use rank-specific key for RNG state to ensure each rank saves its own state
         rng_key = f"rng_state_{dist.get_rank()}"
 
         to_save_dict = {
-            "model": ModelWrapper(model).state_dict(),
+            "model": self._lora_state(model, optimizer) if self.lora_only else ModelWrapper(model).state_dict(),
             "optim": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "trainer": {
@@ -1269,9 +1492,14 @@ class DistributedCheckpointer(AbstractCheckpointer):
         dataloader_wrapper = _DataloaderWrapper(self.callbacks)
         if dataloader_wrapper.has_state():
             to_save_dict["dataloader"] = dataloader_wrapper.state_dict()
+        elif self.lora_only:
+            raise ValueError("Adapter recovery requires per-rank dataloader state")
 
         if self.callbacks is not None:
             self.callbacks.on_save_checkpoint(model, state_dict=to_save_dict)
+
+        if self.lora_only and set(to_save_dict["model"]) != set(self._lora_model_keys[0]):
+            raise ValueError("Checkpoint callback changed the adapter-only model membership")
 
         for k in to_save_dict.keys():
             output_dirname = os.path.join(self.save_dirname, f"iter_{iteration:09}/{k}")

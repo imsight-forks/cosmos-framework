@@ -606,6 +606,9 @@ class CheckpointConfig(BaseModel):
 
     model_config = _PYDANTIC_MODEL_CONFIG
     local_dirname: Optional[str] = Field(default=None, description="Explicit filesystem checkpoint root; independent of job logs.")
+    lora_only: bool = Field(default=False, description="Write adapters and native training state without frozen base weights.")
+    base_checkpoint_path: Optional[str] = Field(default=None, description="Immutable external native base checkpoint for adapter-only recovery.")
+    lora_identity: Optional[str] = Field(default=None, description="JSON object binding adapter recovery to its semantic/data/runtime identity.")
 
     dcp_per_thread_copy_ahead: Optional[int] = Field(
         default=None,

@@ -432,6 +432,9 @@ def apply_fsdp(
     # for pure FSDP. In the overlay design cp does NOT fold into the FSDP
     # shard axis; cp/cfgp are handled by separate meshes.
     fsdp_kwargs = {"mesh": fsdp_mesh(parallel_dims), "mp_policy": mp_policy}
+    block_kwargs = dict(fsdp_kwargs)
+    if parallelism_config.reshard_after_forward is not None:
+        block_kwargs["reshard_after_forward"] = parallelism_config.reshard_after_forward
 
     inner = model.model
 
@@ -460,7 +463,7 @@ def apply_fsdp(
     root_vision_blocks = set(inner.model.visual.blocks) if model.hf_config.model_type == "qwen3_5" else set()
     for _, _, block in reversed(slots):
         if block not in root_vision_blocks:
-            fully_shard(block, **fsdp_kwargs)
+            fully_shard(block, **block_kwargs)
     log.info(f"Wrapped {len(slots)} sub-modules.")
 
     # Wrap the full inner model to cover remaining parameters

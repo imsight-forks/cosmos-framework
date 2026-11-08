@@ -140,16 +140,16 @@ class TransferSFTDataset(SFTDataset):
         self.compressed_store = None
         if source_view_compressed_labels_manifest is not None:
             from datagen_aigc_render.video_samples.compressed_controls import CompressedControlStore
-            from datagen_aigc_render.video_samples.training_multi import SourceViewTrainingRecordV2
+            from datagen_aigc_render.video_samples.training_multi import parse_source_view_training_record
 
-            if any(row.get("source_view", {}).get("schema_version") != 2 for row in self.metadata):
+            if any(row.get("source_view", {}).get("schema_version") not in (2, 3) for row in self.metadata):
                 raise ValueError("Compressed labels require version-two source-view rows")
             self.compressed_store = CompressedControlStore.load(
                 Path(source_view_compressed_labels_manifest),
                 None if source_view_compressed_labels_root is None else Path(source_view_compressed_labels_root),
             )
             self.compressed_store.verify_records(
-                [SourceViewTrainingRecordV2.model_validate(row["source_view"]) for row in self.metadata]
+                [parse_source_view_training_record(row["source_view"]) for row in self.metadata]
             )
 
     def _load_precomputed_control(
@@ -291,7 +291,7 @@ class TransferSFTDataset(SFTDataset):
                 "Source-view loading requires the compatible installed datagen-aigc-render package; "
                 "install the product wheel in this Cosmos runtime"
             ) from exc
-        if metadata["source_view"].get("schema_version", 1) == 2:
+        if metadata["source_view"].get("schema_version", 1) in (2, 3):
             return self._process_source_view_multi(metadata)
         record = SourceViewTrainingRecord.model_validate(metadata["source_view"])
         bindings = SourceViewTrainingBindings.model_validate(metadata["source_bindings"])
@@ -332,11 +332,11 @@ class TransferSFTDataset(SFTDataset):
             MODE_CONTROLS,
             ConditioningMixturePolicy,
             SourceViewTrainingBindingsV2,
-            SourceViewTrainingRecordV2,
+            parse_source_view_training_record,
             open_source_view_multi,
         )
 
-        record = SourceViewTrainingRecordV2.model_validate(metadata["source_view"])
+        record = parse_source_view_training_record(metadata["source_view"])
         bindings = SourceViewTrainingBindingsV2.model_validate(metadata["source_bindings"])
         if self.num_video_frames not in (-1, record.declaration.frame_count):
             raise ValueError(f"sample {record.sample_id}: configured frame count differs")
@@ -407,13 +407,13 @@ def _source_view_metadata(record: dict) -> dict:
         )
     except ImportError as exc:
         raise RuntimeError("Source-view rows require the installed compatible datagen-aigc-render package") from exc
-    if record["source_view"].get("schema_version", 1) == 2:
+    if record["source_view"].get("schema_version", 1) in (2, 3):
         from datagen_aigc_render.video_samples.training_multi import (
             SourceViewTrainingBindingsV2,
-            SourceViewTrainingRecordV2,
+            parse_source_view_training_record,
         )
 
-        frozen = SourceViewTrainingRecordV2.model_validate(record["source_view"])
+        frozen = parse_source_view_training_record(record["source_view"])
         SourceViewTrainingBindingsV2.model_validate(record["source_bindings"])
     else:
         frozen = SourceViewTrainingRecord.model_validate(record["source_view"])
@@ -610,19 +610,19 @@ def get_transfer_sft_dataset(
         if len(versions) != 1:
             raise ValueError("Source-view schema versions require separate dataset identities")
         revision = SOURCE_VIEW_LOADER_REVISION
-        if versions == {2}:
+        if versions in ({2}, {3}):
             from datagen_aigc_render.video_samples.training_multi import (
                 SOURCE_VIEW_MULTI_LOADER_REVISION,
                 ConditioningMixturePolicy,
-                SourceViewTrainingRecordV2,
+                parse_source_view_training_record,
                 source_view_multi_dataset_identity,
                 source_view_training_execution_identity,
             )
 
             identity = source_view_multi_dataset_identity(
-                tuple(SourceViewTrainingRecordV2.model_validate(record["source_view"]) for record in source_rows)
+                tuple(parse_source_view_training_record(record["source_view"]) for record in source_rows)
             )
-            revision = SOURCE_VIEW_MULTI_LOADER_REVISION
+            revision = "dsgen-source-view-multi-v3" if versions == {3} else SOURCE_VIEW_MULTI_LOADER_REVISION
             if control_type == "mixed":
                 policy = ConditioningMixturePolicy.model_validate(conditioning_mixture or {})
                 expected_execution = source_view_training_execution_identity(identity, policy)

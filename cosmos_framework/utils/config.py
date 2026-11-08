@@ -275,6 +275,12 @@ class CheckpointConfig:
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
 
+    # Opt-in local LoRA recovery: persist adapters and training state, with the
+    # immutable native base referenced externally rather than copied per save.
+    lora_only: bool = False
+    base_checkpoint_path: Optional[str] = None
+    lora_identity: Optional[str] = None
+
     # Optional local synchronous FileSystemWriter GPU-to-CPU copy-ahead bytes.
     # None preserves the writer defaults; zero selects its serial CPU loader.
     # This does not change the async producer's pinned-memory staging.
