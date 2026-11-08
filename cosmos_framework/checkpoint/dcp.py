@@ -976,7 +976,7 @@ class DistributedCheckpointer(AbstractCheckpointer):
             adapter_manifest = None
             if self.lora_only:
                 from datagen_aigc_render.cosmos3_training.checkpoints import (
-                    AdapterCheckpointManifest,
+                    inspect_adapter_checkpoint,
                     MANIFEST_NAME,
                     verify_adapter_checkpoint,
                 )
@@ -991,7 +991,7 @@ class DistributedCheckpointer(AbstractCheckpointer):
                             expected_world_size=dist.get_world_size(),
                         ).model_dump(mode="json")
                     )
-                    adapter_manifest = AdapterCheckpointManifest.model_validate(value)
+                    adapter_manifest = inspect_adapter_checkpoint(Path(source.path))
                     if resume_keys != sorted(self.CHECKPOINT_KEYS) or self.config_checkpoint.keys_to_skip_loading:
                         raise ValueError("Adapter recovery requires complete training state and no skipped keys")
                 elif Path(source.path).resolve() != Path(self.config_checkpoint.base_checkpoint_path).resolve():
@@ -1434,6 +1434,7 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     root, base=base, adapter_keys=adapters, frozen_keys=frozen,
                     iteration=int(checkpoint_file.removeprefix("iter_")),
                     world_size=dist.get_world_size(), identity=self._lora_identity,
+                    migration=to_save_dict.get("dataloader", ({}, ""))[0].get("continuation", {}).get("migration"),
                 )
                 return manifest.model_dump(mode="json")
 

@@ -4,6 +4,7 @@
 import functools
 import inspect
 import os
+from pathlib import Path
 import signal
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -530,14 +531,16 @@ class ImaginaireTrainer:
         if self.config.trainer.run_validation and (
             (iteration == 0 and self.config.trainer.run_validation_on_start)
             or (iteration > 0 and self.config.trainer.run_validation_on_resume)
+            or self._validation_requested_at == iteration
         ):
+            self._validation_requested_at = None
             self.validate(model, dataloader_val, iteration=iteration)
 
         if self.config.trainer.save_zero_checkpoint and iteration == 0:
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=0)
 
         _end_training = False
-        if torch.are_deterministic_algorithms_enabled():
+        if iteration == 0 and torch.are_deterministic_algorithms_enabled():
             # Re-seed all global RNGs after init (model load, checkpoint load, compile warmup,
             # callbacks) so data-augmentation randomness starts from a deterministic state
             # regardless of how much RNG state init consumed.
@@ -612,7 +615,7 @@ class ImaginaireTrainer:
                     # Do the following when an actual optimizer (update) step has been made.
                     iteration += 1
                     # Save checkpoint.
-                    if iteration % self.config.checkpoint.save_iter == 0:
+                    if self.config.checkpoint.save_iter > 0 and iteration % self.config.checkpoint.save_iter == 0:
                         self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_training_step_end(
                         model,
@@ -646,7 +649,7 @@ class ImaginaireTrainer:
         log.success("Done with training.")
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
-        if iteration % self.config.checkpoint.save_iter != 0 and self._stop_after_checkpoint_at != iteration:
+        if (self.config.checkpoint.save_iter <= 0 or iteration % self.config.checkpoint.save_iter != 0) and self._stop_after_checkpoint_at != iteration and not (Path(self.checkpointer.save_dirname) / f"iter_{iteration:09d}" / "adapter-checkpoint.json").is_file():
             self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()
@@ -767,37 +770,43 @@ class ImaginaireTrainer:
             dataloader_val (torch.utils.data.DataLoader): The validation data loader.
             iteration (int): Current iteration number.
         """
-        self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
-        model.eval()
-        max_val_iter = self.config.trainer.max_val_iter
-        reuse_iterator = getattr(self.config.trainer, "prefetch_validation", False) and max_val_iter is not None
-        validation_iterator = self._validation_iterator if reuse_iterator else None
-        if validation_iterator is None:
-            validation_iterator = iter(dataloader_val)
-            if reuse_iterator:
-                self._validation_iterator = validation_iterator
+        try:
+            self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
+            model.eval()
+            max_val_iter = self.config.trainer.max_val_iter
+            reuse_iterator = getattr(self.config.trainer, "prefetch_validation", False) and max_val_iter is not None
+            validation_iterator = self._validation_iterator if reuse_iterator else None
+            if validation_iterator is None:
+                validation_iterator = iter(dataloader_val)
+                if reuse_iterator:
+                    self._validation_iterator = validation_iterator
 
-        val_iter = 0
-        restarted_iterator = False
-        with ema.ema_scope(model, enabled=model.config.ema.enabled):
-            while max_val_iter is None or val_iter < max_val_iter:
-                try:
-                    data_batch = next(validation_iterator)
-                except StopIteration:
-                    if reuse_iterator:
-                        self._validation_iterator = None
-                        if val_iter == 0 and not restarted_iterator:
-                            validation_iterator = iter(dataloader_val)
-                            self._validation_iterator = validation_iterator
-                            restarted_iterator = True
-                            continue
-                    break
-                data_batch = misc.to(data_batch, device="cuda")
-                self.callbacks.on_validation_step_start(model, data_batch, iteration=iteration)
-                output_batch, loss = model.validation_step(data_batch, iteration)
-                self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
-                val_iter += 1
-        if val_iter:
-            # End callbacks may generate previews; release full-size validation tensors first.
-            del data_batch, output_batch, loss
-        self.callbacks.on_validation_end(model, iteration=iteration)
+            val_iter = 0
+            restarted_iterator = False
+            with ema.ema_scope(model, enabled=model.config.ema.enabled):
+                while max_val_iter is None or val_iter < max_val_iter:
+                    try:
+                        data_batch = next(validation_iterator)
+                    except StopIteration:
+                        if reuse_iterator:
+                            self._validation_iterator = None
+                            if val_iter == 0 and not restarted_iterator:
+                                validation_iterator = iter(dataloader_val)
+                                self._validation_iterator = validation_iterator
+                                restarted_iterator = True
+                                continue
+                        break
+                    data_batch = misc.to(data_batch, device="cuda")
+                    self.callbacks.on_validation_step_start(model, data_batch, iteration=iteration)
+                    output_batch, loss = model.validation_step(data_batch, iteration)
+                    self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
+                    val_iter += 1
+            if val_iter:
+                # End callbacks may generate previews; release full-size validation tensors first.
+                del data_batch, output_batch, loss
+            self.callbacks.on_validation_end(model, iteration=iteration)
+        finally:
+            for callback in self.callbacks._callbacks:
+                restore_rng = getattr(callback, "restore_validation_rng", None)
+                if restore_rng is not None:
+                    restore_rng()
