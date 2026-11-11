@@ -928,6 +928,10 @@ class DistributedCheckpointer(AbstractCheckpointer):
             value = self._lora_collective(
                 lambda: bind_base_checkpoint(Path(self.config_checkpoint.base_checkpoint_path)).model_dump(mode="json")
             )
+            if os.environ.get("DSGEN_COSMOS3_CLUSTER"):
+                # Admission compared content on every node. The broadcast binds
+                # immutable files; its publisher's physical root is not portable.
+                value["root"] = str((Path(self.config_checkpoint.base_checkpoint_path) / "model").resolve(strict=True))
             self._lora_base = BaseCheckpointBinding.model_validate(value)
         return self._lora_base
 
@@ -1418,7 +1422,11 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     planner=save_planner,
                 )
 
-        if self.lora_only:
+        if self.lora_only and os.environ.get("DSGEN_COSMOS3_CLUSTER"):
+            from datagen_aigc_render.cosmos3_training.cluster_checkpoint import complete_native_checkpoint
+
+            complete_native_checkpoint(self, checkpoint_file, to_save_dict.get("dataloader", ({}, ""))[0])
+        elif self.lora_only:
             from datagen_aigc_render.cosmos3_training.checkpoints import publish_adapter_checkpoint
 
             dist.barrier()
